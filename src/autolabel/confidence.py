@@ -1,19 +1,21 @@
-from typing import List, Optional, Tuple, Union
+from typing import List, Optional, Tuple, Union, Dict
 import math
 import numpy as np
 import pickle as pkl
 import json
-import requests
+import httpx
 import scipy.stats as stats
 import os
 import logging
 
-from autolabel.schema import LLMAnnotation
+from autolabel.schema import LLMAnnotation, ConfidenceCacheEntry
 from autolabel.models import BaseModel
+from autolabel.cache import BaseCache
 
 from tenacity import (
     before_sleep_log,
     retry,
+    retry_if_not_exception_type,
     stop_after_attempt,
     wait_exponential,
 )
@@ -22,17 +24,26 @@ logger = logging.getLogger(__name__)
 
 
 class ConfidenceCalculator:
+    TTL_MS = 60 * 60 * 24 * 7 * 1000  # 1 week
+
     def __init__(
-        self, score_type: str = "logprob_average", llm: Optional[BaseModel] = None
+        self,
+        score_type: str = "logprob_average",
+        endpoint: str = None,
+        llm: Optional[BaseModel] = None,
+        cache: Optional[BaseCache] = None,
     ) -> None:
         self.score_type = score_type
+        self.endpoint = endpoint
         self.llm = llm
-        self.tokens_to_ignore = {"<unk>"}
+        self.cache = cache
+        self.tokens_to_ignore = {"<unk>", "", "\\n"}
         self.SUPPORTED_CALCULATORS = {
             "logprob_average": self.logprob_average,
             "p_true": self.p_true,
+            "logprob_average_per_key": self.logprob_average_per_key,
+            "logprob_average_per_label": self.logprob_average_per_label,
         }
-        self.BASE_API = "https://refuel-llm.refuel.ai/"
         self.REFUEL_API_ENV = "REFUEL_API_KEY"
         if self.REFUEL_API_ENV in os.environ and os.environ[self.REFUEL_API_ENV]:
             self.REFUEL_API_KEY = os.environ[self.REFUEL_API_ENV]
@@ -50,29 +61,158 @@ class ConfidenceCalculator:
         called "logprobs". This dictionary further must contain "top_logprobs"
         that is a list of JSONs mapping tokens to their logprobs
         """
-        logprob_cumulative, count = 0, 0
+        logprob_cumulative, count = 1.0, 0
         for token in logprobs:
             token_str = list(token.keys())[0]
-            if token_str not in self.tokens_to_ignore:
-                logprob_cumulative += (
+            if (
+                token_str.strip() not in self.tokens_to_ignore
+                and token[token_str] is not None
+            ):
+                logprob_cumulative *= (
                     token[token_str]
-                    if token[token_str] >= 0
+                    if token[token_str] > 0
                     else math.e ** (token[token_str])
                 )
                 count += 1
-        return logprob_cumulative / count if count > 0 else 0
+        return logprob_cumulative ** (1.0 / count) if count > 0 else 0
 
-    def p_true(self, model_generation: LLMAnnotation, prompt: str, **kwargs) -> float:
-        p_true_prompt = f"{prompt}{model_generation.raw_response} \n Is the answer to the last example correct? Answer in one word on the same line [Yes/No]: "
+    def logprob_average_per_label(
+        self,
+        model_generation: LLMAnnotation,
+        delimiter: str = ";",
+        **kwargs,
+    ) -> float:
+        """
+        This function calculates the confidence score per label when there are multiple labels in the response (i.e. multilabel tasks). This will return
+        a confidence score per label.
+        """
+        logprob_per_label = {}
+        logprobs = model_generation.generation_info["logprobs"]["top_logprobs"]
+        if logprobs is None or len(logprobs) == 0:
+            return logprob_per_label
+
+        # Remove all characters before a '\n' character in the logprobs, as
+        # this is parsed during the generation process
+        # In this case if input logprobs is
+        # [{"xx\nc": -1.2},{"Ab\n": -1.2}, {"Abc": -1.2}, {";": -1.3}, {"B": -1.4}, {"cd": -1.6}, {";": -1.5}, {"C": -1.4}]
+        # The output logprobs would be [{"Abc": -1.2}, {";": -1.3}, {"B": -1.4}, {"cd": -1.6}, {";": -1.5}, {"C": -1.4}]
+        for i in range(len(logprobs) - 1, -1, -1):
+            cur_key = list(logprobs[i].keys())[0]
+            if "\n" in cur_key:
+                new_key = cur_key.split("\n")[-1].strip()
+                if not new_key:
+                    logprobs = logprobs[i + 1 :]
+                else:
+                    logprobs[i] = {new_key: logprobs[i][cur_key]}
+                    logprobs = logprobs[i:]
+                break
+
+        # Suppose the output for which we compute confidence is "Abc;Bcd;C"
+        # In this case the logprobs can be a list of dictionaries like
+        # [{"Abc": -1.2}, {";": -1.3}, {"B": -1.4}, {"cd": -1.6}, {";": -1.5}, {"C": -1.4}]
+        curr_label = ""
+        logprob_start_idx = 0
+        for i in range(len(logprobs)):
+            for char in list(logprobs[i].keys())[0]:
+                if char == delimiter:
+                    logprob_end_idx = i if logprob_start_idx < i else i + 1
+                    logprob_per_label[curr_label.strip()] = self.logprob_average(
+                        logprobs[logprob_start_idx:logprob_end_idx]
+                    )
+                    curr_label = ""
+                    logprob_start_idx = i + 1
+                else:
+                    curr_label += char
+
+        # Average the logprobs for the last label (or only label if there is just one label)
+        if logprob_start_idx < len(logprobs):
+            logprob_per_label[curr_label.strip()] = self.logprob_average(
+                logprobs[logprob_start_idx:]
+            )
+        return logprob_per_label
+
+    def logprob_average_per_key(
+        self,
+        logprobs: Union[list, dict],
+        keys: list,
+        **kwargs,
+    ):
+        """
+        This function calculates the confidence score per key. This will return
+        a confidence score per key.
+        """
+        # Find the logprob for each key
+        logprob_per_key = {}
+        if logprobs is None or len(logprobs) == 0:
+            return logprob_per_key
+
+        # Suppose the output for which we compute confidence is {"A": "B", "C": "D"}
+        # In this case the logprobs can be a list of dictionaries like
+        # [{"{": -1.2}, {"\"A": -1.3}, {"\"": -1.4}, {":": -1.5}, {"\"B\"": -1.6}, ...]
+        mapping = []
+        full_string = ""
+        for i in range(len(logprobs)):
+            for char in list(logprobs[i].keys())[0]:
+                mapping.append(i)
+                full_string += char
+        # Here full string would be the actual output string reconstructed i.e {"A": "B", "C": "D"}
+        # The mapping here maps every character in this output string to the corresponding token
+        # index in the logprobs list. This is because a single token can have multiple characters.
+        # Using this, from a given character index we can map to the token responsible for that character.
+
+        # Find the locations of each key in the logprobs as indices
+        # into the logprobs list
+        locations = []
+        for key in keys:
+            key_to_find = f'"{key}":'
+            loc = full_string.find(key_to_find)
+            if loc == -1:
+                # We did not find the key in the logprobs so we set its confidence as 0
+                # This should not be possible if the LLM followed its guidelines.
+                logprob_per_key[key] = 0
+            start_token = mapping[loc]
+            end_token = mapping[loc + len(key_to_find) - 1]
+            locations.append((start_token, end_token, key))
+        locations.sort()
+        # Here, the locations consist of the start and end *token* indices for each key
+        # i.e for the keys A and B, we find the start and end tokens where they are found in the logprobs list
+        # and store them in locations. For eg - locations can be [(1, 3, "A"), (9, 12, "C")]
+
+        if len(logprob_per_key) != 0:
+            logger.warning("Some keys not found in logprobs")
+
+        for i in range(len(locations) - 1):
+            # Average the logprobs from the end of this to the start of the next token
+            # This means that we average the logprobs of all tokens from the end of the key token
+            # to the start of the next key token thus for the key "A" this would average the tokens
+            # responsible for generating "B",
+            logprob_per_key[locations[i][2]] = self.logprob_average(
+                logprobs[locations[i][1] + 1 : locations[i + 1][0]]
+            )
+        if len(locations) > 0 and len(logprobs) > locations[-1][1] + 1:
+            # Average the logprobs from the end of the last token to the end of the logprobs
+            logprob_per_key[locations[-1][2]] = self.logprob_average(
+                logprobs[locations[-1][1] + 1 :]
+            )
+
+        return logprob_per_key
+
+    async def p_true(self, model_generation: LLMAnnotation, **kwargs) -> float:
+        p_true_prompt = f"{model_generation.raw_response} \n Is the answer to the last example correct? Answer in one word on the same line [Yes/No]: "
 
         if self.llm.returns_token_probs():
+            p_true_prompt = model_generation.prompt + p_true_prompt
             response = self.llm.label([p_true_prompt])
             response_logprobs = response.generations[0][0].generation_info["logprobs"][
                 "top_logprobs"
             ]
         else:
-            yes_logprob = self.compute_confidence(p_true_prompt, "Yes")
-            no_logprob = self.compute_confidence(p_true_prompt, "No")
+            p_true_prompt = model_generation.prompt + p_true_prompt
+            yes_logprob = await self.compute_confidence(p_true_prompt, "Yes")
+            no_logprob = await self.compute_confidence(p_true_prompt, "No")
+            if not yes_logprob or not no_logprob:
+                # Error while calculating logprobs
+                return 0
             response_logprobs = (
                 yes_logprob
                 if list(yes_logprob[0].values())[0] > list(no_logprob[0].values())[0]
@@ -86,7 +226,17 @@ class ConfidenceCalculator:
                 return -math.e ** token[token_str]
         return 0
 
-    def calculate(self, model_generation: LLMAnnotation, **kwargs) -> float:
+    def return_empty_logprob(
+        self, model_generation: LLMAnnotation
+    ) -> Union[float, Dict]:
+        if self.score_type == "logprob_average_per_key":
+            keys = model_generation.label.keys()
+            model_generation.confidence_score = {key: 0 for key in keys}
+        else:
+            model_generation.confidence_score = 0
+        return model_generation.confidence_score
+
+    async def calculate(self, model_generation: LLMAnnotation, **kwargs) -> float:
         if self.score_type not in self.SUPPORTED_CALCULATORS:
             raise NotImplementedError()
 
@@ -94,10 +244,37 @@ class ConfidenceCalculator:
         if not self.llm.returns_token_probs():
             if model_generation.raw_response == "":
                 model_generation.confidence_score = 0
-                return model_generation
-            logprobs = self.compute_confidence(
-                model_generation.prompt, model_generation.raw_response
-            )
+                return model_generation.confidence_score
+            if self.cache:
+                cache_entry = ConfidenceCacheEntry(
+                    prompt=model_generation.prompt,
+                    raw_response=model_generation.raw_response,
+                    score_type=self.score_type,
+                )
+                logprobs = self.cache.lookup(cache_entry)
+
+                # On cache miss, compute logprobs using API call and update cache
+                if logprobs == None:
+                    logprobs = await self.compute_confidence(
+                        model_generation.prompt,
+                        model_generation.raw_response,
+                    )
+                    if not logprobs:
+                        return self.return_empty_logprob(model_generation)
+                    cache_entry = ConfidenceCacheEntry(
+                        prompt=model_generation.prompt,
+                        raw_response=model_generation.raw_response,
+                        logprobs=logprobs,
+                        score_type=self.score_type,
+                        ttl_ms=self.TTL_MS,
+                    )
+                    self.cache.update(cache_entry)
+            else:
+                logprobs = await self.compute_confidence(
+                    model_generation.prompt, model_generation.raw_response
+                )
+                if not logprobs:
+                    return self.return_empty_logprob(model_generation)
         else:
             if model_generation.generation_info is None:
                 logger.debug("No generation info found")
@@ -105,11 +282,20 @@ class ConfidenceCalculator:
                 return model_generation
             logprobs = model_generation.generation_info["logprobs"]["top_logprobs"]
 
+        keys = None
+        if self.score_type == "logprob_average_per_key":
+            assert isinstance(
+                model_generation.label, dict
+            ), "logprob_average_per_key requires a dict label from attribute extraction"
+            keys = model_generation.label.keys()
+
         confidence = self.SUPPORTED_CALCULATORS[self.score_type](
             model_generation=model_generation,
             logprobs=logprobs,
+            keys=keys,
             **kwargs,
         )
+        model_generation.confidence_score = confidence
         return confidence
 
     @retry(
@@ -117,29 +303,43 @@ class ConfidenceCalculator:
         stop=stop_after_attempt(5),
         wait=wait_exponential(multiplier=1, min=2, max=10),
         before_sleep=before_sleep_log(logger, logging.WARNING),
+        retry=retry_if_not_exception_type(ValueError),
     )
-    def _call_with_retry(self, model_input, model_output) -> requests.Response:
+    async def _call_with_retry(self, model_input, model_output):
         payload = {
-            "data": {"model_input": model_input, "model_output": model_output},
-            "task": "confidence",
+            "messages": [
+                {"role": "user", "content": model_input},
+                {"role": "assistant", "content": model_output},
+            ]
         }
         headers = {"refuel_api_key": self.REFUEL_API_KEY}
-        response = requests.post(self.BASE_API, json=payload, headers=headers)
-        # raise Exception if status != 200
-        response.raise_for_status()
-        return response
+        if self.endpoint is None:
+            raise ValueError("Endpoint not provided")
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                self.endpoint, json=payload, headers=headers, timeout=30
+            )
+            # raise Exception if status != 200
+            response.raise_for_status()
+            return response
 
-    def compute_confidence(self, model_input, model_output) -> Union[dict, List[dict]]:
+    async def compute_confidence(
+        self, model_input, model_output
+    ) -> Union[dict, List[dict]]:
+        """
+        This function computes the confidence score for the given model_input and model_output
+        and returns the logprobs for each token in the output. If there is an error, it returns None.
+        """
         try:
             if self.REFUEL_API_KEY is None:
                 logger.error(
                     f"Did not find {self.REFUEL_API_ENV}, please add an environment variable"
                     f" `{self.REFUEL_API_ENV}` which contains it"
                 )
-                return [{"": 0.5}]
+                return None
             else:
-                response = self._call_with_retry(model_input, model_output)
-                return json.loads(response.json()["body"])
+                response = await self._call_with_retry(model_input, model_output)
+                return json.loads(response.json())["logprobs"]
         except Exception as e:
             # This signifies an error in computing confidence score
             # using the API. We give it a score of 0.5 and go ahead
@@ -147,7 +347,7 @@ class ConfidenceCalculator:
             logger.error(
                 f"Unable to compute confidence score: {e}",
             )
-            return [{"": 0.5}]
+            return None
 
     @classmethod
     def compute_completion(cls, confidence: List[float], threshold: float) -> float:

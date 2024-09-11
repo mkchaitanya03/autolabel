@@ -1,7 +1,7 @@
 from abc import ABC, abstractmethod
 from autolabel.cache import BaseCache
 from autolabel.transforms.schema import TransformCacheEntry, TransformError
-from typing import Dict, Any
+from typing import Dict, Any, List
 import logging
 
 logger = logging.getLogger(__name__)
@@ -42,11 +42,11 @@ class BaseTransform(ABC):
         return {k: self._output_columns.get(k, None) for k in self.COLUMN_NAMES}
 
     @property
-    def transform_error_column(self) -> str:
+    def transform_error_columns(self) -> List:
         """
         Returns the name of the column that stores the error if transformation fails.
         """
-        return f"{self.name()}_error"
+        return [f"{v}_error" for v in self.output_columns.values() if v is not None]
 
     @abstractmethod
     async def _apply(self, row: Dict[str, Any]) -> Dict[str, Any]:
@@ -68,36 +68,46 @@ class BaseTransform(ABC):
         """
         return {}
 
+    @abstractmethod
+    def input_columns(self) -> List[str]:
+        """
+        Returns a list of input columns required by the transform.
+        Returns:
+            A list of input columns required by the transform.
+        """
+        return []
+
     async def apply(self, row: Dict[str, Any]) -> Dict[str, Any]:
         if self.cache is not None:
+            input = {key: row.get(key, None) for key in self.input_columns()}
             cache_entry = TransformCacheEntry(
                 transform_name=self.name(),
                 transform_params=self.params(),
-                input=row,
+                input=input,
                 ttl_ms=self.TTL_MS,
             )
             output = self.cache.lookup(cache_entry)
 
             if output is not None:
                 # Cache hit
+                for col in self.transform_error_columns:
+                    output[col] = None
                 return output
 
         try:
             output = await self._apply(row)
         except Exception as e:
             logger.error(f"Error applying transform {self.name()}. Exception: {str(e)}")
-            output = {
-                k: self.NULL_TRANSFORM_TOKEN
-                for k in self.output_columns.values()
-                if k is not None
-            }
-            output[self.transform_error_column] = str(e)
+            output = {k: str(e) for k in self.output_columns.values() if k is not None}
+            for col in self.transform_error_columns:
+                output[col] = str(e)
             return output
 
         if self.cache is not None:
             cache_entry.output = output
             self.cache.update(cache_entry)
-
+        for col in self.transform_error_columns:
+            output[col] = None
         return output
 
     def _return_output_row(self, row: Dict[str, Any]) -> Dict[str, Any]:

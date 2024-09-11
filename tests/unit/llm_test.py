@@ -1,10 +1,15 @@
+import json
+
+from langchain.schema import Generation, LLMResult
+from openai.types.chat.chat_completion import ChatCompletion, Choice
+from openai.types.chat.chat_completion_message import ChatCompletionMessage
+from pytest import approx
+
 from autolabel.configs import AutolabelConfig
 from autolabel.models.anthropic import AnthropicLLM
 from autolabel.models.openai import OpenAILLM
-from autolabel.models.palm import PaLMLLM
-from autolabel.models.refuel import RefuelLLM
-from langchain.schema import Generation, LLMResult
-from pytest import approx
+from autolabel.models.openai_vision import OpenAIVisionLLM
+from autolabel.models.refuelV2 import RefuelLLMV2
 
 
 ################### ANTHROPIC TESTS #######################
@@ -16,7 +21,7 @@ def test_anthropic_initialization():
     )
 
 
-def test_anthropic_label(mocker):
+async def test_anthropic_label(mocker):
     model = AnthropicLLM(
         config=AutolabelConfig(
             config="tests/assets/banking/config_banking_anthropic.json"
@@ -29,7 +34,7 @@ def test_anthropic_label(mocker):
             generations=[[Generation(text="Answers")] for _ in prompts]
         ),
     )
-    x = model.label(prompts)
+    x = await model.label(prompts)
     assert [i[0].text for i in x.generations] == ["Answers", "Answers"]
     assert sum(x.costs) == approx(0.00010944, rel=1e-3)
 
@@ -42,7 +47,7 @@ def test_anthropic_get_cost():
     )
     example_prompt = "TestingExamplePrompt"
     curr_cost = model.get_cost(example_prompt)
-    assert curr_cost == approx(0.03271306, rel=1e-3)
+    assert curr_cost == approx(0.024024, rel=1e-3)
 
 
 def test_anthropic_return_probs():
@@ -64,7 +69,7 @@ def test_gpt35_initialization():
     )
 
 
-def test_gpt35_label(mocker):
+async def test_gpt35_label(mocker):
     model = OpenAILLM(
         config=AutolabelConfig(config="tests/assets/banking/config_banking.json")
     )
@@ -75,7 +80,7 @@ def test_gpt35_label(mocker):
             generations=[[Generation(text="Answers")] for _ in prompts]
         ),
     )
-    x = model.label(prompts)
+    x = await model.label(prompts)
     assert [i[0].text for i in x.generations] == ["Answers", "Answers"]
 
 
@@ -92,7 +97,7 @@ def test_gpt35_return_probs():
     model = OpenAILLM(
         config=AutolabelConfig(config="tests/assets/banking/config_banking.json")
     )
-    assert model.returns_token_probs() is False
+    assert model.returns_token_probs() is True
 
 
 ################### OPENAI GPT 3.5 TESTS #######################
@@ -105,7 +110,7 @@ def test_gpt4_initialization():
     )
 
 
-def test_gpt4_label(mocker):
+async def test_gpt4_label(mocker):
     model = OpenAILLM(
         config=AutolabelConfig(config="tests/assets/banking/config_banking_gpt4.json")
     )
@@ -116,7 +121,7 @@ def test_gpt4_label(mocker):
             generations=[[Generation(text="Answers")] for _ in prompts]
         ),
     )
-    x = model.label(prompts)
+    x = await model.label(prompts)
     assert [i[0].text for i in x.generations] == ["Answers", "Answers"]
     assert sum(x.costs) == approx(0.00023999, rel=1e-3)
 
@@ -134,103 +139,162 @@ def test_gpt4_return_probs():
     model = OpenAILLM(
         config=AutolabelConfig(config="tests/assets/banking/config_banking_gpt4.json")
     )
-    assert model.returns_token_probs() is False
+    assert model.returns_token_probs() is True
 
 
 ################### OPENAI GPT 4 TESTS #######################
 
 
-################### PALM TESTS #######################
-def test_palm_initialization(mocker):
-    mocker.patch(
-        "vertexai.preview.language_models.TextGenerationModel.from_pretrained",
-        return_value="Test",
-    )
-    model = PaLMLLM(
-        config=AutolabelConfig(config="tests/assets/banking/config_banking_palm.json")
+################### OPENAI GPT 4V TESTS #######################
+def test_gpt4V_initialization():
+    model = OpenAIVisionLLM(
+        config=AutolabelConfig(config="tests/assets/banking/config_banking_gpt4V.json")
     )
 
 
-def test_palm_label(mocker):
-    mocker.patch(
-        "vertexai.preview.language_models.TextGenerationModel.from_pretrained",
-        return_value="Test",
+async def test_gpt4V_label(mocker):
+    model = OpenAIVisionLLM(
+        config=AutolabelConfig(config="tests/assets/banking/config_banking_gpt4V.json")
     )
-    model = PaLMLLM(
-        config=AutolabelConfig(config="tests/assets/banking/config_banking_palm.json")
+    prompts = [
+        json.dumps({"text": "test1", "image_url": "dummy1.jpg"}),
+        json.dumps({"text": "test2", "image_url": "dummy2.jpg"}),
+    ]
+    model.client.chat.completions._post = lambda *args, **kargs: ChatCompletion(
+        id="test",
+        choices=[
+            Choice(
+                finish_reason="stop",
+                index=0,
+                message=ChatCompletionMessage(content="Answers", role="assistant"),
+            )
+        ],
+        created=0,
+        model="test",
+        object="chat.completion",
     )
-    prompts = ["test1", "test2"]
-    mocker.patch(
-        "langchain.llms.VertexAI.generate",
-        return_value=LLMResult(
-            generations=[[Generation(text="Answers")] for _ in prompts]
-        ),
-    )
-    x = model.label(prompts)
+    x = await model.label(prompts)
     assert [i[0].text for i in x.generations] == ["Answers", "Answers"]
-    assert sum(x.costs) == approx(2.4e-05, rel=1e-3)
+    assert sum(x.costs) == approx(0.01568, rel=1e-3)
 
 
-def test_palm_get_cost(mocker):
-    mocker.patch(
-        "vertexai.preview.language_models.TextGenerationModel.from_pretrained",
-        return_value="Test",
+def test_gpt4V_get_cost():
+    model = OpenAIVisionLLM(
+        config=AutolabelConfig(config="tests/assets/banking/config_banking_gpt4V.json")
     )
-    model = PaLMLLM(
-        config=AutolabelConfig(config="tests/assets/banking/config_banking_palm.json")
+    example_prompt = json.dumps(
+        {"text": "TestingExamplePrompt", "image_url": "dummy1.jpg"}
     )
-    example_prompt = "TestingExamplePrompt"
     curr_cost = model.get_cost(example_prompt)
-    assert curr_cost == approx(0.00402, rel=1e-3)
+    assert curr_cost == approx(0.01682, rel=1e-3)
 
 
-def test_palm_return_probs(mocker):
-    mocker.patch(
-        "vertexai.preview.language_models.TextGenerationModel.from_pretrained",
-        return_value="Test",
-    )
-    model = PaLMLLM(
-        config=AutolabelConfig(config="tests/assets/banking/config_banking_palm.json")
+def test_gpt4V_return_probs():
+    model = OpenAIVisionLLM(
+        config=AutolabelConfig(config="tests/assets/banking/config_banking_gpt4V.json")
     )
     assert model.returns_token_probs() is False
 
 
-################### PALM TESTS #######################
+################### OPENAI GPT 4V TESTS #######################
 
 
 ################### REFUEL TESTS #######################
 def test_refuel_initialization():
-    model = RefuelLLM(
+    model = RefuelLLMV2(
         config=AutolabelConfig(config="tests/assets/banking/config_banking_refuel.json")
     )
 
 
-def test_refuel_label(mocker):
+async def test_refuel_label(mocker):
     class PostRequestMockResponse:
-        def __init__(self, resp):
+        def __init__(self, resp, status_code):
             self.resp = resp
+            self.status_code = status_code
 
         def json(self):
-            return {"body": self.resp}
+            return self.resp
 
         def raise_for_status(self):
             pass
 
-    model = RefuelLLM(
+    model = RefuelLLMV2(
         config=AutolabelConfig(config="tests/assets/banking/config_banking_refuel.json")
     )
     prompts = ["test1", "test2"]
     mocker.patch(
         "requests.post",
-        return_value=PostRequestMockResponse(resp='"Answers"'),
+        return_value=PostRequestMockResponse(
+            resp='{"generated_text": "Answers"}', status_code=200
+        ),
     )
-    x = model.label(prompts)
+    x = await model.label(prompts)
     assert [i[0].text for i in x.generations] == ["Answers", "Answers"]
     assert sum(x.costs) == 0
 
 
+async def test_refuel_label_non_retryable(mocker):
+    class PostRequestMockResponse:
+        def __init__(self, resp, status_code):
+            self.resp = resp
+            self.status_code = status_code
+            self.text = resp
+
+        def json(self):
+            return self.resp
+
+        def raise_for_status(self):
+            pass
+
+    model = RefuelLLMV2(
+        config=AutolabelConfig(config="tests/assets/banking/config_banking_refuel.json")
+    )
+    prompts = ["test1", "test2"]
+    mocker.patch(
+        "requests.post",
+        return_value=PostRequestMockResponse(
+            resp='{"error_message": "Error123"}', status_code=422
+        ),
+    )
+    x = await model.label(prompts)
+    assert [i[0].text for i in x.generations] == ["", ""]
+    for error in x.errors:
+        assert "NonRetryable Error:" in error.error_message
+    assert sum(x.costs) == 0
+
+
+async def test_refuel_label_retryable(mocker):
+    class PostRequestMockResponse:
+        def __init__(self, resp, status_code):
+            self.resp = resp
+            self.status_code = status_code
+            self.text = resp
+
+        def json(self):
+            return self.resp
+
+        def raise_for_status(self):
+            pass
+
+    model = RefuelLLMV2(
+        config=AutolabelConfig(config="tests/assets/banking/config_banking_refuel.json")
+    )
+    prompts = ["test1", "test2"]
+    mocker.patch(
+        "requests.post",
+        return_value=PostRequestMockResponse(
+            resp='{"error_message": "Error123"}', status_code=500
+        ),
+    )
+    x = await model.label(prompts)
+    assert [i[0].text for i in x.generations] == ["", ""]
+    for error in x.errors:
+        assert "NonRetryable Error:" not in error.error_message
+    assert sum(x.costs) == 0
+
+
 def test_refuel_get_cost():
-    model = RefuelLLM(
+    model = RefuelLLMV2(
         config=AutolabelConfig(config="tests/assets/banking/config_banking_refuel.json")
     )
     example_prompt = "TestingExamplePrompt"
@@ -239,10 +303,10 @@ def test_refuel_get_cost():
 
 
 def test_refuel_return_probs():
-    model = RefuelLLM(
+    model = RefuelLLMV2(
         config=AutolabelConfig(config="tests/assets/banking/config_banking_refuel.json")
     )
-    assert model.returns_token_probs() is False
+    assert model.returns_token_probs() is True
 
 
 ################### REFUEL TESTS #######################

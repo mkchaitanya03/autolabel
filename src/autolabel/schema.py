@@ -2,8 +2,9 @@ from datetime import datetime
 from enum import Enum
 from typing import Any, Dict, List, Optional, Union
 
+import json
 import pandas as pd
-from langchain.schema import Generation
+from langchain.schema import Generation, ChatGeneration
 from pydantic import BaseModel
 
 from autolabel.configs import AutolabelConfig
@@ -14,12 +15,18 @@ class ModelProvider(str, Enum):
     """Enum containing all LLM providers currently supported by autolabeler"""
 
     OPENAI = "openai"
+    OPENAI_VISION = "openai_vision"
     ANTHROPIC = "anthropic"
     HUGGINGFACE_PIPELINE = "huggingface_pipeline"
+    HUGGINGFACE_PIPELINE_VISION = "huggingface_pipeline_vision"
     REFUEL = "refuel"
+    REFUELV2 = "refuelV2"
     GOOGLE = "google"
     COHERE = "cohere"
+    MISTRAL = "mistral"
     CUSTOM = "custom"
+    TGI = "tgi"
+    VLLM = "vllm"
 
 
 class TaskType(str, Enum):
@@ -30,6 +37,7 @@ class TaskType(str, Enum):
     QUESTION_ANSWERING = "question_answering"
     ENTITY_MATCHING = "entity_matching"
     MULTILABEL_CLASSIFICATION = "multilabel_classification"
+    ATTRIBUTE_EXTRACTION = "attribute_extraction"
 
 
 class FewShotAlgorithm(str, Enum):
@@ -40,10 +48,6 @@ class FewShotAlgorithm(str, Enum):
     MAX_MARGINAL_RELEVANCE = "max_marginal_relevance"
     LABEL_DIVERSITY_RANDOM = "label_diversity_random"
     LABEL_DIVERSITY_SIMILARITY = "label_diversity_similarity"
-
-
-class TaskStatus(str, Enum):
-    ACTIVE = "active"
 
 
 class MetricType(str, Enum):
@@ -61,6 +65,11 @@ class MetricType(str, Enum):
     F1_MACRO = "f1_macro"
     F1_WEIGHTED = "f1_weighted"
     TEXT_PARTIAL_MATCH = "text_partial_match"
+    # Token Classification metrics
+    F1_EXACT = "f1_exact"
+    F1_STRICT = "f1_strict"
+    F1_PARTIAL = "f1_partial"
+    F1_ENT_TYPE = "f1_ent_type"
     # Confidence metrics
     AUROC = "auroc"
     THRESHOLD = "threshold"
@@ -85,10 +94,14 @@ class MetricResult(BaseModel):
 class ErrorType(str, Enum):
     """Enum of supported error types"""
 
+    CONTEXT_LENGTH_ERROR = "context_length_exceeded_error"
+    RATE_LIMIT_ERROR = "rate_limit_exceeded_error"
     LLM_PROVIDER_ERROR = "llm_provider_error"
     PARSING_ERROR = "parsing_error"
     OUTPUT_GUIDELINES_NOT_FOLLOWED_ERROR = "output_guidelines_not_followed_error"
     EMPTY_RESPONSE_ERROR = "empty_response_error"
+    INVALID_LLM_RESPONSE_ERROR = "invalid_llm_response_error"
+    NO_EXTRACTION_ERROR = "no_extraction_error"
 
 
 class LabelingError(BaseModel):
@@ -109,109 +122,102 @@ class LLMAnnotation(BaseModel):
     raw_response: Optional[str] = ""
     explanation: Optional[str] = ""
     prompt: Optional[str] = ""
+    input_tokens: Optional[int] = None
+    output_tokens: Optional[int] = None
+    cost: Optional[float] = None
+    latency: Optional[float] = None
     error: Optional[LabelingError] = None
-
-
-class Dataset(BaseModel):
-    """Contains Dataset parameters, including input file path, indexes for state management (e.g. job batching and retries), and a unique ID"""
-
-    id: str
-    input_file: str
-    start_index: int
-    end_index: int
-
-    class Config:
-        orm_mode = True
-
-    @classmethod
-    def create_id(
-        self,
-        dataset: Union[str, pd.DataFrame],
-        config: AutolabelConfig,
-        start_index: int,
-        max_items: int,
-    ) -> str:
-        """
-        Generates a unique ID for the given Dataset configuration
-        Args:
-            dataset: either 1) input file name or 2) pandas Dataframe
-            config:  AutolabelConfig object containing project settings
-            start_index: index to begin labeling job at (used for job batching, retries, state management)
-            max_items: number of data points to label, beginning at start_index
-
-        Returns:
-            filehash: a unique ID generated from an MD5 hash of the functions parameters
-        """
-        if isinstance(dataset, str):
-            filehash = calculate_md5(
-                [open(dataset, "rb"), config._dataset_config, start_index, max_items]
-            )
-        else:
-            filehash = calculate_md5(
-                [dataset.to_csv(), config._dataset_config, start_index, max_items]
-            )
-        return filehash
-
-
-class Task(BaseModel):
-    id: str
-    task_type: TaskType
-    model_name: str
-    config: str
-
-    class Config:
-        orm_mode = True
-
-    @classmethod
-    def create_id(self, config: AutolabelConfig) -> str:
-        filehash = calculate_md5(config.config)
-        return filehash
-
-
-class TaskRun(BaseModel):
-    id: Optional[str] = None
-    created_at: datetime
-    task_id: str
-    dataset_id: str
-    current_index: int
-    output_file: str
-    status: TaskStatus
-    error: Optional[str] = None
-    metrics: Optional[Dict[str, Any]] = None
-
-    class Config:
-        orm_mode = True
-
-
-class Annotation(BaseModel):
-    id: Optional[str] = None
-    index: int
-    llm_annotation: Optional[LLMAnnotation] = None
-
-    class Config:
-        orm_mode = True
+    multilabel_confidence: Optional[Dict[str, float]] = None
 
 
 class GenerationCacheEntry(BaseModel):
     model_name: str
     prompt: str
     model_params: str
-    generations: Optional[List[Generation]] = None
+    generations: Optional[List[Union[Generation, ChatGeneration]]] = None
     creation_time_ms: Optional[int] = -1
     ttl_ms: Optional[int] = -1
 
     class Config:
         orm_mode = True
 
+    def get_id(self) -> str:
+        """
+        Generates a unique ID for the given generation cache configuration
+        """
+        return calculate_md5([self.model_name, self.model_params, self.prompt])
+
+    def get_serialized_output(self) -> str:
+        """
+        Returns the serialized cache entry output
+        """
+        return json.dumps([gen.dict() for gen in self.generations])
+
+    def deserialize_output(
+        self, output: str
+    ) -> List[Union[Generation, ChatGeneration]]:
+        """
+        Deserializes the cache entry output
+        """
+        generations = [
+            Generation(**gen) if gen["type"] == "Generation" else ChatGeneration(**gen)
+            for gen in json.loads(output)
+        ]
+        return generations
+
+
+class ConfidenceCacheEntry(BaseModel):
+    prompt: Optional[str] = ""
+    raw_response: Optional[str] = ""
+    logprobs: Optional[list] = None
+    score_type: Optional[str] = "logprob_average"
+    creation_time_ms: Optional[int] = -1
+    ttl_ms: Optional[int] = -1
+
+    class Config:
+        orm_mode = True
+
+    def get_id(self) -> str:
+        """
+        Generates a unique ID for the given confidence cache configuration
+        """
+        return calculate_md5([self.prompt, self.raw_response, self.score_type])
+
+    def get_serialized_output(self) -> str:
+        """
+        Returns the serialized cache entry output
+        """
+        return json.dumps(self.logprobs)
+
+    def deserialize_output(self, output: str) -> Dict[str, float]:
+        """
+        Deserializes the cache entry output
+        """
+        return json.loads(output)
+
 
 class RefuelLLMResult(BaseModel):
     """List of generated outputs. This is a List[List[]] because
     each input could have multiple candidate generations."""
 
-    generations: List[List[Generation]]
+    generations: List[List[Union[Generation, ChatGeneration]]]
 
     """Errors encountered while running the labeling job"""
     errors: List[Optional[LabelingError]]
 
     """Costs incurred during the labeling job"""
     costs: Optional[List[float]] = []
+
+    """Latencies incurred during the labeling job"""
+    latencies: Optional[List[float]] = []
+
+
+class AggregationFunction(str, Enum):
+    """Enum of supported aggregation functions"""
+
+    MAX = "max"
+    MEAN = "mean"
+
+
+AUTO_CONFIDENCE_CHUNKING_COLUMN = "auto"
+TASK_CHAIN_TYPE = "task_chain"

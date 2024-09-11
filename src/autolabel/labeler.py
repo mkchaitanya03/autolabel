@@ -1,50 +1,74 @@
-import logging
-import os
-import io
-from typing import Dict, List, Optional, Tuple, Union
-import json
-import pickle
 import asyncio
-import pandas as pd
-from rich import print as pprint
-from rich.console import Console
-from rich.prompt import Confirm
+import io
+import json
+import logging
+from tqdm import tqdm
+import os
+import pickle
+from typing import Dict, List, Optional, Tuple, Union
 
-from autolabel.cache import SQLAlchemyGenerationCache, SQLAlchemyTransformCache
+import numpy as np
+import pandas as pd
+from rich.console import Console
+from transformers import AutoTokenizer
+
+from autolabel.cache import (
+    BaseCache,
+    SQLAlchemyConfidenceCache,
+    SQLAlchemyGenerationCache,
+    SQLAlchemyTransformCache,
+)
 from autolabel.confidence import ConfidenceCalculator
 from autolabel.configs import AutolabelConfig
 from autolabel.dataset import AutolabelDataset
-from autolabel.data_models import AnnotationModel, TaskRunModel
-from autolabel.database import StateManager
-from autolabel.few_shot import ExampleSelectorFactory, BaseExampleSelector
-from autolabel.models import BaseModel, ModelFactory
+from autolabel.few_shot import (
+    DEFAULT_EMBEDDING_PROVIDER,
+    PROVIDER_TO_MODEL,
+    BaseExampleSelector,
+    ExampleSelectorFactory,
+)
+from autolabel.few_shot.label_selector import LabelSelector
 from autolabel.metrics import BaseMetric
-from autolabel.transforms import BaseTransform, TransformFactory
+from autolabel.models import BaseModel, ModelFactory
 from autolabel.schema import (
+    AUTO_CONFIDENCE_CHUNKING_COLUMN,
+    AggregationFunction,
     LLMAnnotation,
     MetricResult,
-    TaskRun,
-    TaskStatus,
+    TaskType,
 )
 from autolabel.tasks import TaskFactory
+from autolabel.transforms import BaseTransform, TransformFactory
 from autolabel.utils import (
-    maybe_round,
-    print_table,
-    track,
-    track_with_stats,
     gather_async_tasks_with_progress,
     get_format_variables,
     in_notebook,
+    maybe_round,
+    print_table,
     safe_serialize_to_string,
+    track,
+    track_with_stats,
 )
 
 logger = logging.getLogger(__name__)
+logging.getLogger("httpx").setLevel(logging.WARNING)
+
 
 COST_TABLE_STYLES = {
     "parameter": "magenta bold",
     "value": "green bold",
 }
 METRIC_TABLE_STYLE = "cyan bold"
+
+DEFAULT_TOKENIZATION_MODEL = {
+    "pretrained_model_name_or_path": "NousResearch/Llama-2-13b-chat-hf",
+    "revision": "d73f5fa9c4bc135502e04c27b39660747172d76b",
+}
+
+MERGE_FUNCTION = {
+    AggregationFunction.MAX: np.max,
+    AggregationFunction.MEAN: np.mean,
+}
 
 
 class LabelingAgent:
@@ -55,14 +79,35 @@ class LabelingAgent:
         config: Union[AutolabelConfig, str, dict],
         cache: Optional[bool] = True,
         example_selector: Optional[BaseExampleSelector] = None,
-        create_task: Optional[bool] = True,
         console_output: Optional[bool] = True,
+        generation_cache: Optional[BaseCache] = SQLAlchemyGenerationCache(),
+        transform_cache: Optional[BaseCache] = SQLAlchemyTransformCache(),
+        confidence_cache: Optional[BaseCache] = SQLAlchemyConfidenceCache(),
+        confidence_tokenizer: Optional[AutoTokenizer] = None,
+        confidence_endpoint: Optional[str] = None,
+        use_tqdm: Optional[bool] = False,
     ) -> None:
-        self.create_task = create_task
-        self.db = StateManager() if self.create_task else None
-        self.generation_cache = SQLAlchemyGenerationCache() if cache else None
-        self.transform_cache = SQLAlchemyTransformCache() if cache else None
+        self.generation_cache = generation_cache
+        self.transform_cache = transform_cache
+        self.confidence_cache = confidence_cache
+        if not cache:
+            logger.warning(
+                f"cache parameter is deprecated and will be removed soon. Please use generation_cache, transform_cache and confidence_cache instead."
+            )
+            self.generation_cache = None
+            self.transform_cache = None
+            self.confidence_cache = None
+
+        if self.generation_cache is not None:
+            self.generation_cache.initialize()
+        if self.transform_cache is not None:
+            self.transform_cache.initialize()
+        if self.confidence_cache is not None:
+            self.confidence_cache.initialize()
+
         self.console = Console(quiet=not console_output)
+        self.console_output = console_output
+        self.use_tqdm = use_tqdm
 
         self.config = (
             config if isinstance(config, AutolabelConfig) else AutolabelConfig(config)
@@ -71,13 +116,25 @@ class LabelingAgent:
         self.llm: BaseModel = ModelFactory.from_config(
             self.config, cache=self.generation_cache
         )
-        self.confidence = ConfidenceCalculator(
-            score_type="logprob_average", llm=self.llm
-        )
-        self.example_selector = example_selector
 
-        # Only used if we don't use task management
-        self.all_annotations = []
+        if self.config.confidence_chunk_column():
+            if not confidence_tokenizer:
+                self.confidence_tokenizer = AutoTokenizer.from_pretrained(
+                    **DEFAULT_TOKENIZATION_MODEL
+                )
+            else:
+                self.confidence_tokenizer = confidence_tokenizer
+        score_type = "logprob_average"
+        if self.config.task_type() == TaskType.ATTRIBUTE_EXTRACTION:
+            score_type = "logprob_average_per_key"
+        self.confidence = ConfidenceCalculator(
+            score_type=score_type,
+            endpoint=confidence_endpoint,
+            llm=self.llm,
+            cache=self.confidence_cache,
+        )
+
+        self.example_selector = example_selector
 
         if in_notebook():
             import nest_asyncio
@@ -85,6 +142,26 @@ class LabelingAgent:
             nest_asyncio.apply()
 
     def run(
+        self,
+        dataset: AutolabelDataset,
+        output_name: Optional[str] = None,
+        max_items: Optional[int] = None,
+        start_index: int = 0,
+        additional_metrics: Optional[List[BaseMetric]] = [],
+        skip_eval: Optional[bool] = False,
+    ) -> Tuple[pd.Series, pd.DataFrame, List[MetricResult]]:
+        return asyncio.run(
+            self.arun(
+                dataset=dataset,
+                output_name=output_name,
+                max_items=max_items,
+                start_index=start_index,
+                additional_metrics=additional_metrics,
+                skip_eval=skip_eval,
+            )
+        )
+
+    async def arun(
         self,
         dataset: AutolabelDataset,
         output_name: Optional[str] = None,
@@ -103,41 +180,7 @@ class LabelingAgent:
         """
 
         dataset = dataset.get_slice(max_items=max_items, start_index=start_index)
-
-        if self.create_task:
-            self.db.initialize()
-            self.dataset_obj = self.db.initialize_dataset(dataset.df, self.config)
-            self.task_object = self.db.initialize_task(self.config)
-        else:
-            self.all_annotations = []
-
-        if isinstance(dataset, str):
-            csv_file_name = (
-                output_name
-                if output_name
-                else f"{dataset.replace('.csv','')}_labeled.csv"
-            )
-        else:
-            csv_file_name = f"{self.config.task_name()}_labeled.csv"
-
-        if self.create_task:
-            # Initialize task run and check if it already exists
-            self.task_run = self.db.get_task_run(
-                self.task_object.id, self.dataset_obj.id
-            )
-            # Resume/Delete the task if it already exists or create a new task run
-            if self.task_run:
-                logger.info("Task run already exists.")
-                self.task_run = self.handle_existing_task_run(
-                    self.task_run,
-                    csv_file_name,
-                    gt_labels=dataset.gt_labels,
-                    additional_metrics=additional_metrics,
-                )
-            else:
-                self.task_run = self.db.create_task_run(
-                    csv_file_name, self.task_object.id, self.dataset_obj.id
-                )
+        llm_labels = []
 
         # Get the seed examples from the dataset config
         seed_examples = self.config.few_shot_example_set()
@@ -157,7 +200,16 @@ class LabelingAgent:
                 f"Explanation column {self.config.explanation_column()} not found in dataset.\nMake sure that explanations were generated using labeler.generate_explanations(seed_file)."
             )
 
-        if self.example_selector is None:
+        if self.example_selector is None and self.config.few_shot_algorithm():
+            if (
+                self.config.label_selection()
+                and self.config.few_shot_algorithm() != "fixed"
+            ):
+                # TODO: Add support for other few shot algorithms specially semantic similarity
+                raise ValueError(
+                    "Error: Only 'fixed' few shot example selector is supported for label selection."
+                )
+
             self.example_selector = ExampleSelectorFactory.initialize_selector(
                 self.config,
                 [safe_serialize_to_string(example) for example in seed_examples],
@@ -165,33 +217,84 @@ class LabelingAgent:
                 cache=self.generation_cache is not None,
             )
 
-        current_index = self.task_run.current_index if self.create_task else 0
+        if self.config.label_selection():
+            if self.config.task_type() != TaskType.CLASSIFICATION:
+                self.console.print(
+                    "Warning: label_selection only supported for classification tasks!"
+                )
+            else:
+                self.label_selector = LabelSelector(
+                    config=self.config,
+                    embedding_func=PROVIDER_TO_MODEL.get(
+                        self.config.embedding_provider(), DEFAULT_EMBEDDING_PROVIDER
+                    )(model=self.config.embedding_model_name()),
+                )
+
+        current_index = 0
         cost = 0.0
         postfix_dict = {}
 
         indices = range(current_index, len(dataset.inputs))
-
-        for current_index in track_with_stats(
-            indices,
-            postfix_dict,
-            total=len(dataset.inputs) - current_index,
-            console=self.console,
+        selected_labels = self.config.labels_list()
+        for current_index in (
+            track_with_stats(
+                indices,
+                postfix_dict,
+                total=len(dataset.inputs) - current_index,
+                console=self.console,
+            )
+            if self.console_output
+            else tqdm(indices)
+            if self.use_tqdm
+            else indices
         ):
             chunk = dataset.inputs[current_index]
+            examples = []
 
-            if self.example_selector:
-                examples = self.example_selector.select_examples(
-                    safe_serialize_to_string(chunk)
-                )
-            else:
-                examples = []
-                # Construct Prompt to pass to LLM
-            final_prompt = self.task.construct_prompt(chunk, examples)
-
-            response = self.llm.label([final_prompt])
-            for i, generations, error in zip(
-                range(len(response.generations)), response.generations, response.errors
+            if (
+                self.config.label_selection()
+                and self.config.task_type() == TaskType.CLASSIFICATION
             ):
+                # get every column except the one we want to label
+                toEmbed = chunk.copy()
+                if self.config.label_column() and self.config.label_column() in toEmbed:
+                    del toEmbed[self.config.label_column()]
+
+                # convert this to a string
+                toEmbed = json.dumps(toEmbed)
+
+                selected_labels = self.label_selector.select_labels(toEmbed)
+
+                if self.example_selector:
+                    examples = self.example_selector.select_examples(
+                        safe_serialize_to_string(chunk),
+                        selected_labels=selected_labels,
+                        label_column=self.config.label_column(),
+                    )
+                else:
+                    examples = []
+            else:
+                if self.example_selector:
+                    examples = self.example_selector.select_examples(
+                        safe_serialize_to_string(chunk),
+                    )
+
+            # Construct Prompt to pass to LLM
+            final_prompt = self.task.construct_prompt(
+                chunk,
+                examples,
+                selected_labels=selected_labels,
+                max_input_tokens=self.llm.max_context_length,
+                get_num_tokens=self.llm.get_num_tokens,
+            )
+            response = await self.llm.label([final_prompt])
+            for i, generations, error, latency in zip(
+                range(len(response.generations)),
+                response.generations,
+                response.errors,
+                response.latencies,
+            ):
+                input_tokens = self.llm.get_num_tokens(final_prompt)
                 if error is not None:
                     annotation = LLMAnnotation(
                         successfully_labeled=False,
@@ -201,6 +304,9 @@ class LabelingAgent:
                         prompt=final_prompt,
                         confidence_score=0,
                         error=error,
+                        input_tokens=input_tokens,
+                        cost=0,
+                        latency=0,
                     )
                 else:
                     annotations = []
@@ -208,29 +314,81 @@ class LabelingAgent:
                         annotation = self.task.parse_llm_response(
                             generation, chunk, final_prompt
                         )
+                        annotation.input_tokens = input_tokens
+                        annotation.output_tokens = self.llm.get_num_tokens(
+                            annotation.raw_response
+                        )
+                        annotation.cost = sum(response.costs)
+                        annotation.latency = latency
 
                         if self.config.confidence():
-                            annotation.confidence_score = self.confidence.calculate(
-                                model_generation=annotation,
-                                prompt=final_prompt,
-                            )
+                            try:
+                                annotation.confidence_score = (
+                                    await self.confidence.calculate(
+                                        model_generation=annotation
+                                    )
+                                )
+                                if (
+                                    self.config.task_type()
+                                    == TaskType.MULTILABEL_CLASSIFICATION
+                                ):
+                                    multilabel_confidence = (
+                                        self.confidence.logprob_average_per_label(
+                                            model_generation=annotation
+                                        )
+                                    )
+                                    multilabels = (
+                                        annotation.label.split(
+                                            self.config.label_separator()
+                                        )
+                                        if annotation.label
+                                        else []
+                                    )
+                                    multilabel_confidence = {
+                                        k: v
+                                        for k, v in multilabel_confidence.items()
+                                        if k in multilabels
+                                    }
+                                    annotation.multilabel_confidence = (
+                                        multilabel_confidence
+                                    )
+
+                            except Exception as e:
+                                logger.exception(
+                                    f"Error calculating confidence score: {e}"
+                                )
+                                logger.warning(
+                                    f"Could not calculate confidence score for annotation: {annotation}"
+                                )
+                                if (
+                                    self.config.task_type()
+                                    == TaskType.ATTRIBUTE_EXTRACTION
+                                ):
+                                    annotation.confidence_score = {}
+                                else:
+                                    annotation.confidence_score = 0
 
                         annotations.append(annotation)
                     annotation = self.majority_annotation(annotations)
 
-                # Save the annotation in the database
-                self.save_annotation(annotation, current_index, i)
+                llm_labels.append(annotation)
 
             cost += sum(response.costs)
             postfix_dict[self.COST_KEY] = f"{cost:.2f}"
 
             # Evaluate the task every eval_every examples
             if not skip_eval and (current_index + 1) % 100 == 0:
-                llm_labels = self.get_all_annotations()
                 if dataset.gt_labels:
                     eval_result = self.task.eval(
                         llm_labels,
-                        dataset.gt_labels[: len(llm_labels)],
+                        (
+                            dataset.gt_labels[: len(llm_labels)]
+                            if isinstance(dataset.gt_labels, list)
+                            else {
+                                k: v[: len(llm_labels)]
+                                for k, v in dataset.gt_labels.items()
+                            }
+                        ),
                         additional_metrics=additional_metrics,
                     )
 
@@ -245,13 +403,6 @@ class LabelingAgent:
                                 else m.value
                             )
 
-            if self.create_task:
-                # Update task run state
-                self.task_run = self.save_task_run_state(
-                    current_index=current_index + len(chunk)
-                )
-
-        llm_labels = self.get_all_annotations()
         eval_result = None
         table = {}
 
@@ -259,7 +410,11 @@ class LabelingAgent:
         if not skip_eval and dataset.gt_labels:
             eval_result = self.task.eval(
                 llm_labels,
-                dataset.gt_labels[: len(llm_labels)],
+                (
+                    dataset.gt_labels[: len(llm_labels)]
+                    if isinstance(dataset.gt_labels, list)
+                    else {k: v[: len(llm_labels)] for k, v in dataset.gt_labels.items()}
+                ),
                 additional_metrics=additional_metrics,
             )
             # TODO: serialize and write to file
@@ -270,6 +425,8 @@ class LabelingAgent:
                     table[m.name] = m.value
                 else:
                     self.console.print(f"{m.name}:\n{m.value}")
+
+        self.eval_result = eval_result
 
         # print cost
         self.console.print(f"Actual Cost: {maybe_round(cost)}")
@@ -299,7 +456,11 @@ class LabelingAgent:
         """
         dataset = dataset.get_slice(max_items=max_items, start_index=start_index)
 
-        if self.config.confidence() and "REFUEL_API_KEY" not in os.environ:
+        if (
+            self.config.confidence()
+            and "REFUEL_API_KEY" not in os.environ
+            and not self.llm.returns_token_probs()
+        ):
             raise ValueError(
                 "REFUEL_API_KEY environment variable must be set to compute confidence scores. You can request an API key at https://refuel-ai.typeform.com/llm-access."
             )
@@ -332,8 +493,20 @@ class LabelingAgent:
             cache=self.generation_cache is not None,
         )
 
-        input_limit = min(len(dataset.inputs), 100)
+        if self.config.label_selection():
+            if self.config.task_type() != TaskType.CLASSIFICATION:
+                self.console.print(
+                    "Warning: label_selection only supported for classification tasks!"
+                )
+            else:
+                self.label_selector = LabelSelector(
+                    config=self.config,
+                    embedding_func=PROVIDER_TO_MODEL.get(
+                        self.config.embedding_provider(), DEFAULT_EMBEDDING_PROVIDER
+                    )(model=self.config.embedding_model_name()),
+                )
 
+        input_limit = min(len(dataset.inputs), 100) if max_items is None else max_items  # type: ignore
         for input_i in track(
             dataset.inputs[:input_limit],
             description="Generating Prompts...",
@@ -346,7 +519,25 @@ class LabelingAgent:
                 )
             else:
                 examples = []
-            final_prompt = self.task.construct_prompt(input_i, examples)
+            if (
+                self.config.label_selection()
+                and self.config.task_type() == TaskType.CLASSIFICATION
+            ):
+                selected_labels = self.label_selector.select_labels(input_i["example"])
+                final_prompt = self.task.construct_prompt(
+                    input_i,
+                    examples,
+                    selected_labels=selected_labels,
+                    max_input_tokens=self.llm.max_context_length,
+                    get_num_tokens=self.llm.get_num_tokens,
+                )
+            else:
+                final_prompt = self.task.construct_prompt(
+                    input_i,
+                    examples,
+                    max_input_tokens=self.llm.max_context_length,
+                    get_num_tokens=self.llm.get_num_tokens,
+                )
             prompt_list.append(final_prompt)
 
             # Calculate the number of tokens
@@ -365,12 +556,12 @@ class LabelingAgent:
             table, show_header=False, console=self.console, styles=COST_TABLE_STYLES
         )
         self.console.rule("Prompt Example")
-        self.console.print(f"{prompt_list[0]}")
+        self.console.print(f"{prompt_list[0]}", markup=False)
         self.console.rule()
 
     async def async_run_transform(
         self, transform: BaseTransform, dataset: AutolabelDataset
-    ):
+    ) -> AutolabelDataset:
         transform_outputs = [
             transform.apply(input_dict) for input_dict in dataset.inputs
         ]
@@ -385,7 +576,7 @@ class LabelingAgent:
         dataset = AutolabelDataset(final_df, self.config)
         return dataset
 
-    def transform(self, dataset: AutolabelDataset):
+    def transform(self, dataset: AutolabelDataset) -> AutolabelDataset:
         transforms = []
         for transform_dict in self.config.transforms():
             transforms.append(
@@ -395,62 +586,6 @@ class LabelingAgent:
             dataset = asyncio.run(self.async_run_transform(transform, dataset))
 
         return dataset
-
-    def handle_existing_task_run(
-        self,
-        task_run: TaskRun,
-        csv_file_name: str,
-        gt_labels: List[str] = None,
-        additional_metrics: List[BaseMetric] = [],
-    ) -> TaskRun:
-        """
-        Allows for continuing an existing labeling task. The user will be asked whether they wish to continue from where the run previously left off, or restart from the beginning.
-        Args:
-            task_run: TaskRun to retry
-            csv_file_name: path to the dataset we wish to label (only used if user chooses to restart the task)
-            gt_labels: If ground truth labels are provided, performance metrics will be displayed, such as label accuracy
-        """
-        self.console.print(
-            f"There is an existing task with following details: {task_run}"
-        )
-        llm_labels = self.get_all_annotations()
-        if gt_labels and len(llm_labels) > 0:
-            self.console.print("Evaluating the existing task...")
-            gt_labels = gt_labels[: len(llm_labels)]
-            eval_result = self.task.eval(
-                llm_labels, gt_labels, additional_metrics=additional_metrics
-            )
-            table = {}
-            for m in eval_result:
-                if isinstance(m.value, list):
-                    continue
-                elif m.show_running:
-                    table[m.name] = m.value
-                else:
-                    self.console.print(f"{m.name}:\n{m.value}")
-
-            print_table(table, console=self.console, default_style=METRIC_TABLE_STYLE)
-        self.console.print(f"{task_run.current_index} examples labeled so far.")
-        if not Confirm.ask("Do you want to resume the task?"):
-            TaskRunModel.delete_by_id(self.db.session, task_run.id)
-            self.console.print("Deleted the existing task and starting a new one...")
-            task_run = self.db.create_task_run(
-                csv_file_name, self.task_object.id, self.dataset_obj.id
-            )
-        return task_run
-
-    def save_task_run_state(
-        self, current_index: int = None, status: TaskStatus = "", error: str = ""
-    ) -> TaskRun:
-        """Saves the current state of the Task being performed"""
-        # Save the current state of the task
-        if error:
-            self.task_run.error = error
-        if status:
-            self.task_run.status = status
-        if current_index:
-            self.task_run.current_index = current_index
-        return TaskRunModel.update(self.db.session, self.task_run)
 
     def majority_annotation(
         self, annotation_list: List[LLMAnnotation]
@@ -471,7 +606,23 @@ class LabelingAgent:
     def generate_explanations(
         self,
         seed_examples: Union[str, List[Dict]],
+        include_label: bool = True,
+        return_annotations: bool = False,
     ) -> List[Dict]:
+        return asyncio.run(
+            self.agenerate_explanations(
+                seed_examples=seed_examples,
+                include_label=include_label,
+                return_annotations=return_annotations,
+            )
+        )
+
+    async def agenerate_explanations(
+        self,
+        seed_examples: Union[str, List[Dict]],
+        include_label: bool = True,
+        return_annotations: bool = False,
+    ) -> Union[List[Dict], Tuple[List[Dict], List[LLMAnnotation]]]:
         """Use LLM to generate explanations for why examples are labeled the way that they are."""
         out_file = None
         if isinstance(seed_examples, str):
@@ -484,21 +635,60 @@ class LabelingAgent:
             raise ValueError(
                 "The explanation column needs to be specified in the dataset config."
             )
-
+        llm_annotations = []
         for seed_example in track(
             seed_examples,
             description="Generating explanations",
             console=self.console,
         ):
-            explanation_prompt = self.task.get_explanation_prompt(seed_example)
-            explanation = self.llm.label([explanation_prompt])
-            explanation = explanation.generations[0][0].text
-            seed_example["explanation"] = str(explanation) if explanation else ""
+            explanation_prompt = self.task.get_explanation_prompt(
+                seed_example, include_label=include_label
+            )
+            if self.task.image_cols is not None and len(self.task.image_cols) > 0:
+                explanation_prompt = {"text": explanation_prompt}
+                for col in self.task.image_cols:
+                    if col in seed_example and seed_example[col] is not None:
+                        explanation_prompt[col] = seed_example[col]
+                explanation_prompt = json.dumps(explanation_prompt)
+            response = await self.llm.label([explanation_prompt])
+            explanation = response.generations[0][0].text
+            seed_example[explanation_column] = str(explanation) if explanation else ""
+            if return_annotations:
+                error = response.errors[0]
+                input_tokens = self.llm.get_num_tokens(explanation_prompt)
+                if error is not None:
+                    annotation = LLMAnnotation(
+                        successfully_labeled=False,
+                        label=self.task.NULL_LABEL_TOKEN,
+                        raw_response=explanation,
+                        curr_sample=pickle.dumps(seed_example),
+                        prompt=explanation_prompt,
+                        confidence_score=0,
+                        error=error,
+                        input_tokens=input_tokens,
+                        cost=0,
+                        latency=0,
+                    )
+                else:
+                    annotation = LLMAnnotation(
+                        successfully_labeled=True,
+                        label=explanation,
+                        raw_response=explanation,
+                        curr_sample=pickle.dumps(seed_example),
+                        prompt=explanation_prompt,
+                        error=None,
+                        input_tokens=input_tokens,
+                        output_tokens=self.llm.get_num_tokens(explanation),
+                        cost=sum(response.costs),
+                        latency=response.latencies[0],
+                    )
+                llm_annotations.append(annotation)
 
         if out_file:
             df = pd.DataFrame.from_records(seed_examples)
             df.to_csv(out_file, index=False)
-
+        if return_annotations:
+            return seed_examples, llm_annotations
         return seed_examples
 
     def generate_synthetic_dataset(self) -> AutolabelDataset:
@@ -534,23 +724,17 @@ class LabelingAgent:
         self.generation_cache.clear(use_ttl=use_ttl)
         self.transform_cache.clear(use_ttl=use_ttl)
 
-    def save_annotation(self, annotation: LLMAnnotation, current_index: int, i: int):
-        if self.create_task:
-            # Store the annotation in the database
-            AnnotationModel.create_from_llm_annotation(
-                self.db.session,
-                annotation,
-                current_index + i,
-                self.task_run.id,
+    def get_num_tokens(self, inp: str) -> int:
+        if not self.confidence_tokenizer:
+            logger.warning("Confidence tokenizer is not set. Using default tokenizer.")
+            self.confidence_tokenizer = AutoTokenizer.from_pretrained(
+                **DEFAULT_TOKENIZATION_MODEL
             )
-        else:
-            self.all_annotations.append(annotation)
+        """Returns the number of tokens in the prompt"""
+        return len(self.confidence_tokenizer.encode(str(inp)))
 
-    def get_all_annotations(self):
-        if self.create_task:
-            db_result = AnnotationModel.get_annotations_by_task_run_id(
-                self.db.session, self.task_run.id
-            )
-            return [pickle.loads(a.llm_annotation) for a in db_result]
-        else:
-            return self.all_annotations
+    def chunk_string(self, inp: str, chunk_size: int) -> List[str]:
+        """Chunks the input string into chunks of size chunk_size"""
+        tokens = self.confidence_tokenizer.encode(inp)
+        chunks = [tokens[i : i + chunk_size] for i in range(0, len(tokens), chunk_size)]
+        return [self.confidence_tokenizer.decode(chunk) for chunk in chunks]

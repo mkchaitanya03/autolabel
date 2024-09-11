@@ -1,15 +1,17 @@
-from functools import cached_property
-from typing import List, Optional
+import copy
+import ast
 import logging
-
-from autolabel.models import BaseModel
-from autolabel.configs import AutolabelConfig
-from autolabel.cache import BaseCache
-from autolabel.schema import RefuelLLMResult
-from langchain.schema import HumanMessage
-
-
 import os
+from functools import cached_property
+from time import time
+from typing import List, Optional
+
+from langchain.schema import HumanMessage, Generation, LLMResult
+
+from autolabel.cache import BaseCache
+from autolabel.configs import AutolabelConfig
+from autolabel.models import BaseModel
+from autolabel.schema import ErrorType, RefuelLLMResult, LabelingError
 
 logger = logging.getLogger(__name__)
 
@@ -27,8 +29,42 @@ class OpenAILLM(BaseModel):
         "gpt-4-0613",
         "gpt-4-32k",
         "gpt-4-32k-0613",
+        "gpt-4-1106-preview",
+        "gpt-4-0125-preview",
+        "gpt-4o",
+        "gpt-4o-2024-08-06",
+        "gpt-4o-mini",
     ]
-    MODELS_WITH_TOKEN_PROBS = ["text-curie-001", "text-davinci-003"]
+    MODELS_WITH_TOKEN_PROBS = [
+        "text-curie-001",
+        "text-davinci-003",
+        "gpt-3.5-turbo",
+        "gpt-3.5-turbo-0301",
+        "gpt-3.5-turbo-0613",
+        "gpt-3.5-turbo-16k",
+        "gpt-3.5-turbo-16k-0613",
+        "gpt-4",
+        "gpt-4-0314",
+        "gpt-4-32k-0314",
+        "gpt-4-0613",
+        "gpt-4-32k",
+        "gpt-4-32k-0613",
+        "gpt-4-1106-preview",
+        "gpt-4-0125-preview",
+        "gpt-4o",
+        "gpt-4o-2024-08-06",
+        "gpt-4o-mini",
+    ]
+    JSON_MODE_MODELS = [
+        "gpt-3.5-turbo-0125",
+        "gpt-3.5-turbo",
+        "gpt-4-0125-preview",
+        "gpt-4-1106-preview",
+        "gpt-4-turbo-preview",
+        "gpt-4o",
+        "gpt-4o-2024-08-06",
+        "gpt-4o-mini",
+    ]
 
     # Default parameters for OpenAILLM
     DEFAULT_MODEL = "gpt-3.5-turbo"
@@ -36,11 +72,14 @@ class OpenAILLM(BaseModel):
         "max_tokens": 1000,
         "temperature": 0.0,
         "model_kwargs": {"logprobs": 1},
+        "request_timeout": 30,
     }
     DEFAULT_PARAMS_CHAT_ENGINE = {
         "max_tokens": 1000,
         "temperature": 0.0,
+        "request_timeout": 30,
     }
+    DEFAULT_QUERY_PARAMS_CHAT_ENGINE = {"logprobs": True, "top_logprobs": 1}
 
     # Reference: https://openai.com/pricing
     COST_PER_PROMPT_TOKEN = {
@@ -57,6 +96,11 @@ class OpenAILLM(BaseModel):
         "gpt-4-32k-0613": 0.06 / 1000,
         "gpt-4-0314": 0.03 / 1000,
         "gpt-4-32k-0314": 0.06 / 1000,
+        "gpt-4-1106-preview": 0.01 / 1000,
+        "gpt-4-0125-preview": 0.01 / 1000,
+        "gpt-4o": 0.005 / 1000,
+        "gpt-4o-2024-08-06": 0.0025 / 1000,
+        "gpt-4o-mini": 0.15 / 1_000_000,
     }
     COST_PER_COMPLETION_TOKEN = {
         "text-davinci-003": 0.02 / 1000,
@@ -72,6 +116,15 @@ class OpenAILLM(BaseModel):
         "gpt-4-32k-0613": 0.12 / 1000,
         "gpt-4-0314": 0.06 / 1000,
         "gpt-4-32k-0314": 0.12 / 1000,
+        "gpt-4-1106-preview": 0.03 / 1000,
+        "gpt-4-0125-preview": 0.03 / 1000,
+        "gpt-4o": 0.015 / 1000,
+        "gpt-4o-2024-08-06": 0.01 / 1000,
+        "gpt-4o-mini": 0.60 / 1_000_000,
+    }
+    ERROR_TYPE_MAPPING = {
+        "context_length_exceeded": ErrorType.CONTEXT_LENGTH_ERROR,
+        "rate_limit_exceeded": ErrorType.RATE_LIMIT_ERROR,
     }
 
     @cached_property
@@ -84,14 +137,13 @@ class OpenAILLM(BaseModel):
     def __init__(self, config: AutolabelConfig, cache: BaseCache = None) -> None:
         super().__init__(config, cache)
         try:
-            from langchain.chat_models import ChatOpenAI
-            from langchain.llms import OpenAI
             import tiktoken
+            from langchain_openai import ChatOpenAI, OpenAI
         except ImportError:
             raise ImportError(
-                "anthropic is required to use the anthropic LLM. Please install it with the following command: pip install 'refuel-autolabel[openai]'"
+                "openai is required to use the OpenAILLM. Please install it with the following command: pip install 'refuel-autolabel[openai]'"
             )
-
+        self.tiktoken = tiktoken
         # populate model name
         self.model_name = config.model_name() or self.DEFAULT_MODEL
 
@@ -102,21 +154,32 @@ class OpenAILLM(BaseModel):
         model_params = config.model_params()
         if config.logit_bias() != 0:
             model_params = {
-                **self._generate_logit_bias(),
                 **model_params,
+                **self._generate_logit_bias(),
             }
 
+        self.query_params = {}
         if self._engine == "chat":
             self.model_params = {**self.DEFAULT_PARAMS_CHAT_ENGINE, **model_params}
-            self.llm = ChatOpenAI(model_name=self.model_name, **self.model_params)
+            self.query_params = copy.deepcopy(self.DEFAULT_QUERY_PARAMS_CHAT_ENGINE)
+            self.llm = ChatOpenAI(
+                model_name=self.model_name, verbose=False, **self.model_params
+            )
+            if config.json_mode():
+                if self.model_name not in self.JSON_MODE_MODELS:
+                    logger.warning(
+                        f"json_mode is not supported for model {self.model_name}. Disabling json_mode."
+                    )
+                else:
+                    self.query_params["response_format"] = {"type": "json_object"}
         else:
             self.model_params = {
                 **self.DEFAULT_PARAMS_COMPLETION_ENGINE,
                 **model_params,
             }
-            self.llm = OpenAI(model_name=self.model_name, **self.model_params)
-
-        self.tiktoken = tiktoken
+            self.llm = OpenAI(
+                model_name=self.model_name, verbose=False, **self.model_params
+            )
 
     def _generate_logit_bias(self) -> None:
         """Generates logit bias for the labels specified in the config
@@ -138,22 +201,112 @@ class OpenAILLM(BaseModel):
                 for token in tokens:
                     logit_bias[token] = self.config.logit_bias()
                 max_tokens = max(max_tokens, len(tokens))
-
+        logit_bias[encoding.eot_token] = self.config.logit_bias()
         return {"logit_bias": logit_bias, "max_tokens": max_tokens}
 
-    def _label(self, prompts: List[str]) -> RefuelLLMResult:
-        if self._engine == "chat":
-            # Need to convert list[prompts] -> list[messages]
-            # Currently the entire prompt is stuck into the "human message"
-            # We might consider breaking this up into human vs system message in future
-            prompts = [[HumanMessage(content=prompt)] for prompt in prompts]
+    def _chat_backward_compatibility(
+        self, generations: List[LLMResult]
+    ) -> List[LLMResult]:
+        for generation_options in generations:
+            for curr_generation in generation_options:
+                generation_info = curr_generation.generation_info
+                new_logprobs = {"top_logprobs": []}
+                for curr_token in generation_info["logprobs"]["content"]:
+                    new_logprobs["top_logprobs"].append(
+                        {curr_token["token"]: curr_token["logprob"]}
+                    )
+                curr_generation.generation_info["logprobs"] = new_logprobs
+        return generations
+
+    async def _alabel(self, prompts: List[str]) -> RefuelLLMResult:
         try:
-            result = self.llm.generate(prompts)
+            start_time = time()
+            if self._engine == "chat":
+                prompts = [[HumanMessage(content=prompt)] for prompt in prompts]
+                result = await self.llm.agenerate(prompts, **self.query_params)
+                generations = self._chat_backward_compatibility(result.generations)
+            else:
+                result = await self.llm.agenerate(prompts)
+                generations = result.generations
+            end_time = time()
             return RefuelLLMResult(
-                generations=result.generations, errors=[None] * len(result.generations)
+                generations=generations,
+                errors=[None] * len(generations),
+                latencies=[end_time - start_time] * len(generations),
             )
         except Exception as e:
-            return self._label_individually(prompts)
+            logger.exception(f"Unable to generate prediction: {e}")
+            error_message = str(e)
+            error_type = ErrorType.LLM_PROVIDER_ERROR
+            try:
+                json_start, json_end = error_message.find("{"), error_message.rfind("}")
+                error_json = ast.literal_eval(error_message[json_start : json_end + 1])[
+                    "error"
+                ]
+                error_code = error_json.get("code")
+                error_type = self.ERROR_TYPE_MAPPING.get(
+                    error_code, ErrorType.LLM_PROVIDER_ERROR
+                )
+                error_message = error_json.get("message")
+            except Exception as e:
+                logger.error(f"Unable to parse OpenAI error message: {e}")
+
+            return RefuelLLMResult(
+                generations=[[Generation(text="")] for _ in prompts],
+                errors=[
+                    LabelingError(
+                        error_type=error_type,
+                        error_message=error_message,
+                    )
+                    for _ in prompts
+                ],
+                latencies=[0 for _ in prompts],
+            )
+
+    def _label(self, prompts: List[str]) -> RefuelLLMResult:
+        try:
+            start_time = time()
+            if self._engine == "chat":
+                prompts = [[HumanMessage(content=prompt)] for prompt in prompts]
+                result = self.llm.generate(prompts, **self.query_params)
+                generations = self._chat_backward_compatibility(result.generations)
+            else:
+                result = self.llm.generate(prompts)
+                generations = result.generations
+            end_time = time()
+            return RefuelLLMResult(
+                generations=generations,
+                errors=[None] * len(generations),
+                latencies=[end_time - start_time] * len(generations),
+            )
+        except Exception as e:
+            logger.exception(f"Unable to generate prediction: {e}")
+
+            error_message = str(e)
+            error_type = ErrorType.LLM_PROVIDER_ERROR
+            try:
+                json_start, json_end = error_message.find("{"), error_message.rfind("}")
+                error_json = ast.literal_eval(error_message[json_start : json_end + 1])[
+                    "error"
+                ]
+                error_code = error_json.get("code")
+                error_type = self.ERROR_TYPE_MAPPING.get(
+                    error_code, ErrorType.LLM_PROVIDER_ERROR
+                )
+                error_message = error_json.get("message")
+            except Exception as e:
+                logger.error(f"Unable to parse OpenAI error message: {e}")
+            return RefuelLLMResult(
+                generations=[[Generation(text="")] for _ in prompts],
+                errors=[
+                    LabelingError(
+                        error_type=error_type,
+                        error_message=error_message,
+                    )
+                    for _ in prompts
+                ],
+                latencies=[0 for _ in prompts],
+            )
 
     def get_cost(self, prompt: str, label: Optional[str] = "") -> float:
         encoding = self.tiktoken.encoding_for_model(self.model_name)
@@ -175,3 +328,7 @@ class OpenAILLM(BaseModel):
             self.model_name is not None
             and self.model_name in self.MODELS_WITH_TOKEN_PROBS
         )
+
+    def get_num_tokens(self, prompt: str) -> int:
+        encoding = self.tiktoken.encoding_for_model(self.model_name)
+        return len(encoding.encode(prompt))

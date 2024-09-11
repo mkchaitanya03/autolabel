@@ -10,6 +10,7 @@
 <div align="center" style="width:800px">
 
 [![lint](https://github.com/refuel-ai/autolabel/actions/workflows/black.yaml/badge.svg)](https://github.com/refuel-ai/autolabel/actions/workflows/black.yaml/badge.svg) ![Tests](https://github.com/refuel-ai/autolabel/actions/workflows/test.yaml/badge.svg) ![Commit Activity](https://img.shields.io/github/commit-activity/m/refuel-ai/autolabel) [![Discord](https://img.shields.io/discord/1098746693152931901)](https://discord.gg/fweVnRx6CU) [![open in colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/drive/1t-9vNLkyoyySAG_0w3eR98biBOXlMO-E?usp=sharing)
+
 </div>
 
 ## ⚡ Quick Install
@@ -25,6 +26,23 @@
 Access to [large, clean and diverse](https://twitter.com/karpathy/status/1528443124577513472?lang=en) labeled datasets is a critical component for any machine learning effort to be successful. State-of-the-art LLMs like GPT-4 are able to [automatically label data](https://arxiv.org/abs/2303.15056) with [high accuracy](https://arxiv.org/abs/2303.16854), and at a fraction of the cost and time compared to manual labeling.
 
 Autolabel is a Python library to label, clean and enrich text datasets with any Large Language Models (LLM) of your choice.
+
+## 🌟 (New!) Benchmark models on Refuel's Benchmark
+
+Check out our [technical report](https://refuel.ai/blog-posts/announcing-refuel-llm-2) to learn more about the performance of RefuelLLM-v2 on our benchmark. You can replicate the benchmark yourself by following the steps below
+
+```python
+cd autolabel/benchmark
+curl https://autolabel-benchmarking.s3.us-west-2.amazonaws.com/data.zip -o data.zip
+unzip data.zip
+python benchmark.py --model $model --base_dir benchmark-results
+python results.py --eval_dir benchmark-results
+cat results.csv
+```
+
+You can benchmark the relevant model by replacing $model with the name of the model needed to be benchmarked. If it is an API hosted model like `gpt-3.5-turbo`, `gpt-4-1106-preview`, `claude-3-opus-20240229`, `gemini-1.5-pro-preview-0409` or some other Autolabel supported model, just write the name of the model. If the model to be benchmarked is a [vLLM supported model](https://docs.vllm.ai/en/latest/models/supported_models.html) then pass the local path or the huggingface path corresponding to the model. This will run the benchmark along with the _same_ prompts for all models.
+
+The `results.csv` will contain a row with every model that was benchmarked as a row. Look at `benchmark/results.csv` for an example.
 
 ## 🚀 Getting started
 
@@ -156,10 +174,6 @@ ds.df.head()
 Refuel provides access to hosted open source LLMs for labeling, and for estimating confidence This is helpful, because you can calibrate a confidence threshold for your labeling task, and then route less confident labels to humans, while you still get the benefits of auto-labeling for the confident examples.
 
 In order to use Refuel hosted LLMs, you can [request access here](https://refuel-ai.typeform.com/llm-access).
-
-## Benchmark
-
-Check out our [technical report](https://www.refuel.ai/blog-posts/llm-labeling-technical-report) to learn more about the performance of various LLMs, and human annoators, on label quality, turnaround time and cost.
 
 ## 🛠️ Roadmap
 

@@ -1,13 +1,13 @@
 import asyncio
 import hashlib
-import os
 import json
 import logging
-from string import Formatter
+import os
 import re
-import string
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Union
 import shutil
+import string
+from string import Formatter
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Union
 
 import regex
 import wget
@@ -38,6 +38,14 @@ EXAMPLE_DATASETS = [
     "conll2003",
     "movie_reviews",
     "twitter_emotion_detection",
+    "ethos",
+    "craigslist",
+    "math",
+    "lexical_relation",
+    "quoref",
+    "painting-style-classification",
+    "multimodal_science_qa",
+    "figure_extraction",
 ]
 
 NO_SEED_DATASET = [
@@ -118,6 +126,22 @@ def _autolabel_progress(
     )
 
 
+class LiveDisplay:
+    _instance = None
+
+    def __new__(cls, *args, **kwargs):
+        if cls._instance is None:
+            cls._instance = super().__new__(cls)
+            cls._instance.live = Live(*args, **kwargs)
+        return cls._instance
+
+    @classmethod
+    def get_instance(cls, *args, **kwargs):
+        if cls._instance is None:
+            cls._instance = cls(*args, **kwargs)
+        return cls._instance
+
+
 def track(
     sequence: Union[Sequence[ProgressType], Iterable[ProgressType]],
     description: str = None,
@@ -193,18 +217,23 @@ async def gather_async_tasks_with_progress(
     if total is None:
         total = len(tasks)
 
-    async def _task_with_tracker(task, progress, progress_task):
+    group = Group(progress)
+    live = LiveDisplay.get_instance(group, console=console).live
+
+    async def _task_with_tracker(task, progress, progress_task, live):
         res = await task
         progress.advance(
             progress_task,
             advance=min(advance, total - progress.tasks[progress_task].completed),
         )
-        progress.refresh()
+        live.refresh()
         return res
 
-    with progress:
+    with live:
         progress_task = progress.add_task(description, total=total)
-        tasks = [_task_with_tracker(task, progress, progress_task) for task in tasks]
+        tasks = [
+            _task_with_tracker(task, progress, progress_task, live) for task in tasks
+        ]
         return await asyncio.gather(*tasks)
 
 
@@ -244,7 +273,7 @@ def track_with_stats(
     )
 
     group = Group(progress, stats_progress)
-    live = Live(group, console=console)
+    live = LiveDisplay.get_instance(group, console=console).live
 
     if total is None:
         total = len(sequence)
@@ -292,9 +321,11 @@ def print_table(
     """
     # Convert all values to strings
     data = {
-        str(key): [str(maybe_round(v)) for v in value]
-        if isinstance(value, List)
-        else [str(maybe_round(value))]
+        str(key): (
+            [str(maybe_round(v)) for v in value]
+            if isinstance(value, List)
+            else [str(maybe_round(value))]
+        )
         for key, value in data.items()
     }
     table = Table(show_header=show_header)
@@ -325,14 +356,15 @@ def get_data(dataset_name: str, force: bool = False):
 
     def download(url: str) -> None:
         """Downloads the data given an url"""
-        file_name = os.path.basename(url)
+        os.makedirs(os.path.join("data", dataset_name), exist_ok=True)
+        file_name = os.path.join("data", dataset_name, os.path.basename(url))
         if force and os.path.exists(file_name):
             print(f"File {file_name} exists. Removing")
             os.remove(file_name)
 
         if not os.path.exists(file_name):
             print(f"Downloading example dataset from {url} to {file_name}...")
-            wget.download(url, bar=download_bar)
+            wget.download(url, out=file_name, bar=download_bar)
 
     if dataset_name not in EXAMPLE_DATASETS:
         logger.error(
@@ -366,7 +398,7 @@ def normalize_text(s: str) -> str:
     def lower(text):
         return text.lower()
 
-    return white_space_fix(remove_articles(remove_punc(lower(s))))
+    return white_space_fix(remove_articles(remove_punc(lower(str(s)))))
 
 
 def in_notebook():

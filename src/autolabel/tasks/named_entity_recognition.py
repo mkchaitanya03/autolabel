@@ -1,24 +1,26 @@
 import json
+import logging
+import pickle
 import re
 from collections import defaultdict
-from typing import Dict, List, Tuple, Optional
 from copy import deepcopy
+from typing import Callable, Dict, List, Optional, Tuple, Union
 
-from langchain.schema import Generation
-from sklearn.metrics import roc_auc_score
-import logging
+from langchain.prompts.prompt import PromptTemplate
+from langchain.schema import ChatGeneration, Generation
 from nervaluate import Evaluator
-from autolabel.confidence import ConfidenceCalculator
+from sklearn.metrics import roc_auc_score
+
 from autolabel.configs import AutolabelConfig
+from autolabel.metrics import BaseMetric
 from autolabel.schema import (
-    LLMAnnotation,
-    MetricType,
-    MetricResult,
-    LabelingError,
     ErrorType,
+    LabelingError,
+    LLMAnnotation,
+    MetricResult,
+    MetricType,
 )
 from autolabel.tasks import BaseTask
-from autolabel.metrics import BaseMetric
 
 logger = logging.getLogger(__name__)
 
@@ -62,12 +64,21 @@ class NamedEntityRecognitionTask(BaseTask):
             json_output[category].append(named_entity)
         return json_output
 
-    def construct_prompt(self, input: Dict, examples: List) -> str:
+    def construct_prompt(
+        self,
+        input: Dict,
+        examples: List,
+        prompt_template_override: PromptTemplate = None,
+        output_guidelines_override: str = None,
+        max_input_tokens: int = None,
+        get_num_tokens: Optional[Callable] = None,
+        **kwargs,
+    ) -> str:
         # prepare task guideline
         labels_list = self.config.labels_list()
         num_labels = len(labels_list)
-        fmt_task_guidelines = self.task_guidelines.format(
-            num_labels=num_labels, labels="\n".join(labels_list)
+        fmt_task_guidelines = self.task_guidelines.format_map(
+            defaultdict(str, labels="\n".join(labels_list), num_labels=num_labels)
         )
 
         # prepare seed examples
@@ -89,24 +100,67 @@ class NamedEntityRecognitionTask(BaseTask):
         if explanation_column:
             input[explanation_column] = ""
 
-        # populate the current example in the prompt
-        current_example = example_template.format_map(defaultdict(str, input))
+        # check if all mapped keys in input are in the example template
+        try:
+            current_example = example_template.format(**input)
+        except KeyError as e:
+            try:
+                current_example = example_template.format_map(defaultdict(str, input))
+                logger.warn(
+                    f'\n\nKey {e} in the "example_template" in the given config'
+                    f"\n\n{example_template}\n\nis not present in the datsaset columns - {input.keys()}.\n\n"
+                    f"Input - {input}\n\n"
+                    "Continuing with the prompt as {current_example}"
+                )
+            except AttributeError as e:
+                for key in input.keys():
+                    if input[key] is not None:
+                        example_template = example_template.replace(
+                            f"{{{key}}}", input[key]
+                        )
+                current_example = example_template
 
+        # populate the current example in the prompt
+        prompt_template = (
+            self.prompt_template
+            if prompt_template_override is None
+            else prompt_template_override
+        )
+        output_guidelines = (
+            self.output_guidelines
+            if output_guidelines_override is None
+            else output_guidelines_override
+        )
         if self._is_few_shot_mode():
-            return self.prompt_template.format(
+            curr_text_prompt = self.trim_prompt(
+                prompt_template,
                 task_guidelines=fmt_task_guidelines,
-                output_guidelines=self.output_guidelines,
+                output_guidelines=output_guidelines,
                 seed_examples="\n\n".join(fmt_examples),
                 current_example=current_example,
+                max_input_tokens=max_input_tokens,
+                get_num_tokens=get_num_tokens,
             )
         else:
-            return self.prompt_template.format(
+            curr_text_prompt = self.trim_prompt(
+                prompt_template,
                 task_guidelines=fmt_task_guidelines,
-                output_guidelines=self.output_guidelines,
+                output_guidelines=output_guidelines,
                 current_example=current_example,
+                max_input_tokens=max_input_tokens,
+                get_num_tokens=get_num_tokens,
             )
+        if self.image_cols:
+            prompt_dict = {"text": curr_text_prompt}
+            for col in self.image_cols:
+                if input.get(col) is not None and len(input.get(col)) > 0:
+                    prompt_dict[col] = input[col]
+                prompt_dict[col] = input[col]
+            return json.dumps(prompt_dict)
+        else:
+            return curr_text_prompt
 
-    def get_explanation_prompt(self, example: Dict) -> str:
+    def get_explanation_prompt(self, example: Dict, include_label=True) -> str:
         raise NotImplementedError(
             "Explanation generation not implemented for this task"
         )
@@ -127,7 +181,7 @@ class NamedEntityRecognitionTask(BaseTask):
 
         for label in processed_output:
             text = label["text"]
-            matches = [i.start() for i in re.finditer(text, input)]
+            matches = [i.start() for i in re.finditer(re.escape(text), input)]
             count = frequency_count[text]
             # if count of the named entity is greater than the number of matches, default to last found match
             if count >= len(matches):
@@ -144,7 +198,10 @@ class NamedEntityRecognitionTask(BaseTask):
         return processed_output
 
     def parse_llm_response(
-        self, response: Generation, curr_sample: Dict, prompt: str
+        self,
+        response: Union[Generation, ChatGeneration],
+        curr_sample: Dict,
+        prompt: str,
     ) -> LLMAnnotation:
         output = {}
         successfully_labeled = False
@@ -230,14 +287,34 @@ class NamedEntityRecognitionTask(BaseTask):
         )
 
         results, _ = evaluator.evaluate()
-        # f1 score
+        # f1 score for exact match
         eval_metrics.append(
             MetricResult(
-                name=MetricType.F1,
+                name=MetricType.F1_EXACT,
                 value=results["exact"]["f1"],
             )
         )
-
+        # f1 score for strict match
+        eval_metrics.append(
+            MetricResult(
+                name=MetricType.F1_STRICT,
+                value=results["strict"]["f1"],
+            )
+        )
+        # f1 score for partial match
+        eval_metrics.append(
+            MetricResult(
+                name=MetricType.F1_PARTIAL,
+                value=results["partial"]["f1"],
+            )
+        )
+        # f1 score for entity type match
+        eval_metrics.append(
+            MetricResult(
+                name=MetricType.F1_ENT_TYPE,
+                value=results["ent_type"]["f1"],
+            )
+        )
         # accuracy
         accuracy = (
             results.get("strict").get("correct")
@@ -281,14 +358,15 @@ class NamedEntityRecognitionTask(BaseTask):
         Returns:
             List[MetricResult]: list of metrics and corresponding values
         """
-
-        gt_labels = [
-            self.add_text_spans(
-                json.loads(gt_labels[index]), llm_labels[index].curr_sample
+        new_gt_labels = []
+        for index in range(len(llm_labels)):
+            new_gt_labels.append(
+                self.add_text_spans(
+                    json.loads(gt_labels[index]),
+                    llm_labels[index].curr_sample.decode(),
+                )
             )
-            for index in range(len(gt_labels))
-        ]
-
+        gt_labels = new_gt_labels
         (
             curr_gt_labels,
             curr_llm_labels,
@@ -318,9 +396,11 @@ class NamedEntityRecognitionTask(BaseTask):
         eval_metrics.append(
             MetricResult(
                 name=MetricType.COMPLETION_RATE,
-                value=len(curr_llm_labels) / float(len(gt_labels))
-                if len(gt_labels) > 0
-                else 0.0,
+                value=(
+                    len(curr_llm_labels) / float(len(gt_labels))
+                    if len(gt_labels) > 0
+                    else 0.0
+                ),
             )
         )
 

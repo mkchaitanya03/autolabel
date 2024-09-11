@@ -3,7 +3,11 @@ import logging
 from .base import BaseTransform
 from .pdf import PDFTransform
 from .serp_api import SerpApi
+from .serper_api import SerperApi
+from .serper_maps import SerperMaps
+from .custom_api import CustomApi
 from .webpage_transform import WebpageTransform
+from .webpage_scrape import WebpageScrape
 from .image import ImageTransform
 from typing import Dict
 from autolabel.transforms.schema import TransformType
@@ -14,8 +18,12 @@ logger = logging.getLogger(__name__)
 TRANSFORM_REGISTRY = {
     TransformType.PDF: PDFTransform,
     TransformType.WEBPAGE_TRANSFORM: WebpageTransform,
+    TransformType.WEBPAGE_SCRAPE: WebpageScrape,
     TransformType.IMAGE: ImageTransform,
-    TransformType.SERP_API: SerpApi,
+    TransformType.WEB_SEARCH_SERP_API: SerpApi,
+    TransformType.WEB_SEARCH_SERPER: SerperApi,
+    TransformType.CUSTOM_API: CustomApi,
+    TransformType.MAPS_SEARCH: SerperMaps,
 }
 
 

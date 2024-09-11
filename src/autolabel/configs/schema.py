@@ -31,8 +31,6 @@ def populate_few_shot_selection() -> List[str]:
 
 
 # Schema definition for Autolabel API/ calls
-# 'additionalProperties' is set to False for al properties to handle typos
-# for not required properties/fields.
 schema = {
     "$schema": "http://json-schema.org/draft-04/schema#",
     "title": "Label Config",
@@ -52,17 +50,19 @@ schema = {
             "type": "object",
             "properties": {
                 "label_column": {"type": ["string", "null"]},
+                "input_columns": {"type": ["array", "null"]},
                 "label_separator": {"type": ["string", "null"]},
                 "text_column": {"type": ["string", "null"]},
                 "delimiter": {"type": ["string", "null"]},
                 "explanation_column": {"type": ["string", "null"]},
+                "disable_quoting": {"type": ["boolean", "null"]},
             },
-            "additionalProperties": False,
+            "additionalProperties": True,
         },
         "transforms": {
             "type": "array",
             "items": {"type": "object"},
-            "additionalProperties": False,
+            "additionalProperties": True,
         },
         "model": {
             "type": "object",
@@ -77,7 +77,7 @@ schema = {
                 "params": {"type": ["object", "null"]},
             },
             "required": ["provider", "name"],
-            "additionalProperties": False,
+            "additionalProperties": True,
         },
         "embedding": {
             "type": "object",
@@ -88,7 +88,7 @@ schema = {
                 },
                 "model": {"type": "string"},
             },
-            "additionalProperties": False,
+            "additionalProperties": True,
         },
         "prompt": {
             "type": "object",
@@ -108,7 +108,7 @@ schema = {
                 "few_shot_examples": {
                     "anyOf": [
                         {"type": "array", "items": {"type": "object"}},
-                        # When few_shor_example is a string. It shoulf point to the
+                        # When few_shot_examples is a string. It should point to the
                         # filepath of a csv/other files containing the few shot examples
                         {"type": "string"},
                         {"type": "null"},
@@ -120,9 +120,17 @@ schema = {
                 },
                 "few_shot_num": {"type": ["number", "null"]},
                 "chain_of_thought": {"type": ["boolean", "null"]},
+                "label_selection": {"type": ["boolean", "null"]},
+                "label_selection_count": {"type": ["number", "null"]},
+                "attributes": {
+                    "anyOf": [
+                        {"type": "array", "items": {"type": "object"}},
+                        {"type": "null"},
+                    ]
+                },
             },
             "required": ["task_guidelines"],
-            "additionalProperties": False,
+            "additionalProperties": True,
         },
         "dataset_generation": {
             "type": "object",
@@ -138,5 +146,5 @@ schema = {
         "model",
         "prompt",
     ],
-    "additionalProperties": False,
+    "additionalProperties": True,
 }

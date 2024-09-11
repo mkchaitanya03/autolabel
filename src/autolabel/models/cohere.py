@@ -1,10 +1,13 @@
-from typing import List, Optional
 import os
+from time import time
+from typing import List, Optional
 
-from autolabel.models import BaseModel
-from autolabel.configs import AutolabelConfig
+from langchain.schema import Generation
+
 from autolabel.cache import BaseCache
-from autolabel.schema import RefuelLLMResult
+from autolabel.configs import AutolabelConfig
+from autolabel.models import BaseModel
+from autolabel.schema import ErrorType, LabelingError, RefuelLLMResult
 
 
 class CohereLLM(BaseModel):
@@ -22,7 +25,7 @@ class CohereLLM(BaseModel):
         super().__init__(config, cache)
         try:
             import cohere
-            from langchain.llms import Cohere
+            from langchain_community.llms import Cohere
         except ImportError:
             raise ImportError(
                 "cohere is required to use the cohere LLM. Please install it with the following command: pip install 'refuel-autolabel[cohere]'"
@@ -42,12 +45,26 @@ class CohereLLM(BaseModel):
 
     def _label(self, prompts: List[str]) -> RefuelLLMResult:
         try:
+            start_time = time()
             result = self.llm.generate(prompts)
+            end_time = time()
             return RefuelLLMResult(
-                generations=result.generations, errors=[None] * len(result.generations)
+                generations=result.generations,
+                errors=[None] * len(result.generations),
+                latencies=[end_time - start_time] * len(result.generations),
             )
         except Exception as e:
-            return self._label_individually(prompts)
+            return RefuelLLMResult(
+                generations=[[Generation(text="")] for _ in prompts],
+                errors=[
+                    LabelingError(
+                        error_type=ErrorType.LLM_PROVIDER_ERROR,
+                        error_message=str(e),
+                    )
+                    for _ in prompts
+                ],
+                latencies=[0 for _ in prompts],
+            )
 
     def get_cost(self, prompt: str, label: Optional[str] = "") -> float:
         num_prompt_toks = len(self.co.tokenize(prompt).tokens)
@@ -60,3 +77,6 @@ class CohereLLM(BaseModel):
 
     def returns_token_probs(self) -> bool:
         return False
+
+    def get_num_tokens(self, prompt: str) -> int:
+        return len(self.co.tokenize(prompt).tokens)

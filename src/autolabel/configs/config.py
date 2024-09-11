@@ -17,20 +17,28 @@ class AutolabelConfig(BaseConfig):
     EMBEDDING_CONFIG_KEY = "embedding"
     PROMPT_CONFIG_KEY = "prompt"
     DATASET_GENERATION_CONFIG_KEY = "dataset_generation"
+    CHUNKING_CONFIG_KEY = "chunking"
 
     # Dataset config keys (config["dataset"][<key>])
     LABEL_COLUMN_KEY = "label_column"
     LABEL_SEPARATOR_KEY = "label_separator"
     EXPLANATION_COLUMN_KEY = "explanation_column"
+    IMAGE_COLUMNS_KEY = "image_columns"
     TEXT_COLUMN_KEY = "text_column"
+    INPUT_COLUMNS_KEY = "input_columns"
+    OUTPUT_COLUMNS_KEY = "output_columns"
     DELIMITER_KEY = "delimiter"
+    DISABLE_QUOTING = "disable_quoting"
 
     # Model config keys (config["model"][<key>])
     PROVIDER_KEY = "provider"
     MODEL_NAME_KEY = "name"
+    MODEL_MAX_CONTEXT_LENGTH_KEY = "max_context_length"
     MODEL_PARAMS_KEY = "params"
+    MODEL_ENDPOINT_KEY = "endpoint"
     COMPUTE_CONFIDENCE_KEY = "compute_confidence"
     LOGIT_BIAS_KEY = "logit_bias"
+    JSON_MODE = "json_mode"
 
     # Embedding config keys (config["embedding"][<key>])
     EMBEDDING_PROVIDER_KEY = "provider"
@@ -47,11 +55,20 @@ class AutolabelConfig(BaseConfig):
     OUTPUT_GUIDELINE_KEY = "output_guidelines"
     OUTPUT_FORMAT_KEY = "output_format"
     CHAIN_OF_THOUGHT_KEY = "chain_of_thought"
+    LABEL_SELECTION_KEY = "label_selection"
+    LABEL_SELECTION_COUNT_KEY = "label_selection_count"
+    LABEL_SELECTION_THRESHOLD = "label_selection_threshold"
+    ATTRIBUTES_KEY = "attributes"
     TRANSFORM_KEY = "transforms"
 
     # Dataset generation config keys (config["dataset_generation"][<key>])
     DATASET_GENERATION_GUIDELINES_KEY = "guidelines"
     DATASET_GENERATION_NUM_ROWS_KEY = "num_rows"
+
+    # Chunking config keys (config["chunking"][<key>])
+    CONFIDENCE_CHUNK_COLUMN_KEY = "confidence_chunk_column"
+    CONFIDENCE_CHUNK_SIZE_KEY = "confidence_chunk_size"
+    CONFIDENCE_MERGE_FUNCTION_KEY = "confidence_merge_function"
 
     def __init__(self, config: Union[str, Dict], validate: bool = True) -> None:
         super().__init__(config, validate=validate)
@@ -91,6 +108,11 @@ class AutolabelConfig(BaseConfig):
         """Returns information about the prompt for synthetic dataset generation"""
         return self.config.get(self.DATASET_GENERATION_CONFIG_KEY, {})
 
+    @cached_property
+    def _chunking_config(self) -> Dict:
+        """Returns information about the chunking config"""
+        return self.config.get(self.CHUNKING_CONFIG_KEY, {})
+
     # project and task definition config
     def task_name(self) -> str:
         return self.config[self.TASK_NAME_KEY]
@@ -112,13 +134,29 @@ class AutolabelConfig(BaseConfig):
         """Returns the name of the column containing text data we intend to label"""
         return self._dataset_config.get(self.TEXT_COLUMN_KEY, None)
 
+    def input_columns(self) -> List[str]:
+        """Returns the names of the input columns from the dataset that are used in the prompt"""
+        return self._dataset_config.get(self.INPUT_COLUMNS_KEY, [])
+
+    def output_columns(self) -> List[str]:
+        """Returns the names of the expected output fields from the dataset"""
+        return self._dataset_config.get(self.OUTPUT_COLUMNS_KEY, [])
+
     def explanation_column(self) -> str:
         """Returns the name of the column containing an explanation as to why the data is labeled a certain way"""
         return self._dataset_config.get(self.EXPLANATION_COLUMN_KEY, None)
 
+    def image_columns(self) -> List[str]:
+        """Returns the names of the columns containing an image url for the given item"""
+        return self._dataset_config.get(self.IMAGE_COLUMNS_KEY, [])
+
     def delimiter(self) -> str:
         """Returns the token used to seperate cells in the dataset. Defaults to a comma ','"""
         return self._dataset_config.get(self.DELIMITER_KEY, ",")
+
+    def disable_quoting(self) -> bool:
+        """Returns true if quoting is disabled. Defaults to false"""
+        return self._dataset_config.get(self.DISABLE_QUOTING, False)
 
     # Model config
     def provider(self) -> str:
@@ -132,6 +170,14 @@ class AutolabelConfig(BaseConfig):
     def model_params(self) -> Dict:
         """Returns a dict of configured settings for the model (e.g. hyperparameters)"""
         return self._model_config.get(self.MODEL_PARAMS_KEY, {})
+
+    def max_context_length(self, default=None) -> int:
+        """Returns the maximum number of tokens allowed in the context for the model"""
+        return self._model_config.get(self.MODEL_MAX_CONTEXT_LENGTH_KEY, default)
+
+    def model_endpoint(self) -> str:
+        """Returns the endpoint to use for the model"""
+        return self._model_config.get(self.MODEL_ENDPOINT_KEY, None)
 
     def confidence(self) -> bool:
         """Returns true if the model is able to return a confidence score along with its predictions"""
@@ -159,12 +205,12 @@ class AutolabelConfig(BaseConfig):
         if isinstance(self._prompt_config.get(self.VALID_LABELS_KEY, []), List):
             return self._prompt_config.get(self.VALID_LABELS_KEY, [])
         else:
-            return self._prompt_config.get(self.VALID_LABELS_KEY, {}).keys()
+            return list(self._prompt_config.get(self.VALID_LABELS_KEY, {}).keys())
 
     def label_descriptions(self) -> Dict[str, str]:
         """Returns a dict of label descriptions"""
         if isinstance(self._prompt_config.get(self.VALID_LABELS_KEY, []), List):
-            return {}
+            return None
         else:
             return self._prompt_config.get(self.VALID_LABELS_KEY, {})
 
@@ -201,6 +247,29 @@ class AutolabelConfig(BaseConfig):
         """Returns true if the model is able to perform chain of thought reasoning."""
         return self._prompt_config.get(self.CHAIN_OF_THOUGHT_KEY, False)
 
+    def label_selection(self) -> bool:
+        """Returns true if label selection is enabled. Label selection is the process of
+        narrowing down the list of possible labels by similarity to a given input. Useful for
+        classification tasks with a large number of possible classes."""
+        return self._prompt_config.get(self.LABEL_SELECTION_KEY, False)
+
+    def max_selected_labels(self) -> int:
+        """Returns the number of labels to select in LabelSelector"""
+        k = self._prompt_config.get(self.LABEL_SELECTION_COUNT_KEY, 10)
+        if k < 1:
+            return len(self.labels_list())
+        return k
+
+    def label_selection_threshold(self) -> float:
+        """Returns the threshold for label selection in LabelSelector
+        If the similarity score ratio with the top Score is above this threshold,
+        the label is selected."""
+        return self._prompt_config.get(self.LABEL_SELECTION_THRESHOLD, 0.0)
+
+    def attributes(self) -> List[Dict]:
+        """Returns a list of attributes to extract from the text."""
+        return self._prompt_config.get(self.ATTRIBUTES_KEY, [])
+
     def transforms(self) -> List[Dict]:
         """Returns a list of transforms to apply to the data before sending to the model."""
         return self.config.get(self.TRANSFORM_KEY, [])
@@ -216,3 +285,19 @@ class AutolabelConfig(BaseConfig):
         return self._dataset_generation_config.get(
             self.DATASET_GENERATION_NUM_ROWS_KEY, 1
         )
+
+    def confidence_chunk_column(self) -> str:
+        """Returns the column name to use for confidence chunking"""
+        return self._chunking_config.get(self.CONFIDENCE_CHUNK_COLUMN_KEY)
+
+    def confidence_chunk_size(self) -> int:
+        """Returns the chunk size for confidence chunking"""
+        return self._chunking_config.get(self.CONFIDENCE_CHUNK_SIZE_KEY, 3400)
+
+    def confidence_merge_function(self) -> str:
+        """Returns the function to use when merging confidence scores"""
+        return self._chunking_config.get(self.CONFIDENCE_MERGE_FUNCTION_KEY, "max")
+
+    def json_mode(self) -> bool:
+        """Returns true if the model should be used in json mode. Currently only used for OpenAI models."""
+        return self._model_config.get(self.JSON_MODE, False)
